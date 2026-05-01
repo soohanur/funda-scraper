@@ -1,0 +1,489 @@
+"""
+Property Collector Module — Step 1
+
+Navigates the funda.nl search listing pages, extracts property
+identifiers (funda object IDs) across multiple pages, and stores
+them in memory.  Then opens a single property page to confirm.
+
+Funda URL anatomy:
+  https://www.funda.nl/detail/koop/{city}/{type}-{street}/{8-digit-id}/
+
+Pagination:
+  First page : .../zoeken/koop?selected_area=...&availability=...
+  Page N     : same URL + &page=N
+  "Volgende" link in the navigation
+
+Flow:
+  1. Open homepage + accept cookies (warm-up)
+  2. Navigate to search URL with filters
+  3. If reCAPTCHA challenge -> wait (should not happen with CDP)
+  4. Parse property cards -> extract IDs from detail links
+  5. Paginate (next page) until we have the target count
+  6. Open the first property page as proof-of-concept
+"""
+import re
+import time
+import random
+import urllib.parse
+from typing import List, Optional
+from ..utils.logger import setup_logger
+
+logger = setup_logger('funda.collector')
+
+# Regex to extract the 8-digit funda object ID from a detail URL
+FUNDA_ID_PATTERN = re.compile(r'/(\d{7,10})/?(?:\?|$)')
+
+
+class PropertyCollector:
+    """
+    Collects property IDs from funda.nl search result pages.
+
+    Each collected item is a dict: {id, url, address}
+    """
+
+    def __init__(
+        self,
+        browser,
+        search_url: str,
+        target_count: int = 90,
+        min_page_delay: float = 2.0,
+        max_page_delay: float = 5.0,
+        on_progress=None,
+        stop_event=None,
+    ):
+        self.browser = browser
+        self.search_url = search_url
+        self.target_count = target_count
+        self.min_page_delay = min_page_delay
+        self.max_page_delay = max_page_delay
+        self.on_progress = on_progress  # Callback: fn(collected_count, queued_count, total_results, page)
+        self._stop_event = stop_event  # threading.Event — checked to abort early
+
+        # In-memory cache of collected properties
+        self.collected: List[dict] = []
+        self._seen_ids: set = set()
+        
+        # Total search results found on funda (e.g. "1.234 resultaten")
+        self.total_search_results: int = 0
+
+    def _should_stop(self) -> bool:
+        """Check if stop has been requested."""
+        return self._stop_event is not None and self._stop_event.is_set()
+
+    # ─── Public API ───────────────────────────────────────────
+
+    @property
+    def collected_kvk(self) -> List[str]:
+        """Return just the IDs as a list of strings."""
+        return [item["id"] for item in self.collected]
+
+    def collect_kvk_numbers(self, output_queue=None, kvk_storage=None) -> List[str]:
+        """
+        Main entry point for Step 1.
+        
+        Collects ALL available property IDs by paginating through
+        every search result page.
+
+        Args:
+            output_queue: If provided, streams new (non-duplicate) property dicts
+                          into this queue as they're found (for pipelining).
+            kvk_storage:  If provided, filters out already-processed IDs.
+
+        Returns:
+            List of property ID strings (e.g. ['43358870', ...])
+        """
+        if kvk_storage is None:
+            from funda.src.modules.kvk_storage import get_kvk_storage
+            kvk_storage = get_kvk_storage()
+        
+        logger.info("=" * 60)
+        logger.info(f"  STEP 1 — Collecting ALL property IDs (target: {self.target_count})")
+        logger.info("=" * 60)
+
+        # 1. Warm up: visit homepage first and accept cookies
+        logger.info("  Warming up — visiting funda.nl homepage first...")
+        self.browser.navigate_to("https://www.funda.nl/")
+        self._smart_wait()
+
+        if self._should_stop():
+            return []
+
+        # Accept cookies (no simulate_browsing — save time)
+        self.browser.accept_cookies(timeout=8)
+        time.sleep(random.uniform(1, 2))
+
+        if self._should_stop():
+            return []
+
+        # 2. Navigate to the filtered search page
+        logger.info("  Navigating to search page...")
+        self.browser.navigate_to(self.search_url)
+        self._smart_wait()
+
+        # 3. Handle reCAPTCHA challenge if it appears
+        if self.browser.is_captcha_page():
+            logger.warning("reCAPTCHA challenge detected!")
+            if not self.browser.wait_for_captcha_solved(timeout=300):
+                logger.error("reCAPTCHA was not solved — cannot continue.")
+                return []
+            self._smart_wait()
+
+        # 4. Accept cookies again on search page if needed
+        self.browser.accept_cookies(timeout=5)
+        time.sleep(random.uniform(0.5, 1))
+
+        # Extract total search results count from search page
+        self._extract_total_results()
+
+        # Report initial total to controller immediately
+        if self.on_progress and self.total_search_results > 0:
+            self.on_progress(0, 0, self.total_search_results, 0)
+
+        page_number = 1
+        consecutive_empty = 0
+        max_pages = 500  # Safety limit (500 × 15 = 7500 properties)
+        queued_count = 0  # Track how many we've streamed to queue
+
+        while len(self.collected) < self.target_count and page_number <= max_pages:
+            if self._should_stop():
+                logger.info("  Collection stopped by user")
+                break
+
+            if page_number % 10 == 1:
+                logger.info(
+                    f"--- Page {page_number} | Collected so far: "
+                    f"{len(self.collected)} | Queued for scraping: {queued_count} ---"
+                )
+
+            # 5. Extract property IDs from current page
+            before_count = len(self.collected)
+            new_on_this_page = self._extract_properties_from_page()
+
+            # Stream new properties to work queue (for pipelining)
+            if output_queue is not None and new_on_this_page > 0:
+                new_items = self.collected[before_count:]
+                for item in new_items:
+                    if kvk_storage and kvk_storage.exists(item['id']):
+                        continue
+                    output_queue.put(item)
+                    queued_count += 1
+
+            # Report progress to controller (real-time stats)
+            if self.on_progress and page_number % 3 == 0:
+                self.on_progress(len(self.collected), queued_count, self.total_search_results, page_number)
+
+            if new_on_this_page == 0:
+                # Check for captcha mid-scrape
+                if self.browser.is_captcha_page():
+                    logger.warning("reCAPTCHA appeared mid-scraping!")
+                    if not self.browser.wait_for_captcha_solved(timeout=300):
+                        break
+                    self._smart_wait()
+                    new_on_this_page = self._extract_properties_from_page()
+
+                if new_on_this_page == 0:
+                    consecutive_empty += 1
+                    if consecutive_empty >= 3:
+                        logger.info("  3 consecutive empty pages — end of results")
+                        break
+            else:
+                consecutive_empty = 0
+
+            if page_number % 10 == 0:
+                logger.info(
+                    f"  Page {page_number}: +{new_on_this_page} new | Total: {len(self.collected)}"
+                )
+
+            # Enough?
+            if len(self.collected) >= self.target_count:
+                break
+
+            # 6. Go to next page (fast — reduced delays)
+            if not self._go_to_next_page(page_number):
+                logger.warning("Could not navigate to next page — stopping.")
+                break
+
+            page_number += 1
+
+            # Minimal delay between pages (speed optimized, interruptible)
+            delay = random.uniform(self.min_page_delay, self.max_page_delay)
+            for _ in range(int(delay * 2)):
+                if self._should_stop():
+                    break
+                time.sleep(0.5)
+
+            # Every 20 pages, do a captcha check
+            if page_number % 20 == 0:
+                if self.browser.is_captcha_page():
+                    logger.warning("reCAPTCHA appeared after 20 pages!")
+                    if not self.browser.wait_for_captcha_solved(timeout=300):
+                        break
+                    self._smart_wait()
+
+        # Trim to exact target count
+        self.collected = self.collected[: self.target_count]
+
+        logger.info("=" * 60)
+        logger.info(
+            f"  ✓ Collection complete: {len(self.collected)} property IDs across {page_number} pages"
+            f" ({queued_count} queued for scraping)"
+        )
+        logger.info("=" * 60)
+
+        return self.collected_kvk
+
+    def open_property_page(self, kvk_number: str) -> str:
+        """
+        Open a single property page by its ID.
+
+        Tries the stored full URL first; falls back to search.
+        """
+        full_url = None
+        for item in self.collected:
+            if item["id"] == kvk_number:
+                full_url = item["url"]
+                break
+
+        if not full_url:
+            full_url = f"https://www.funda.nl/detail/koop/{kvk_number}/"
+
+        logger.info(f"Opening property page: {full_url}")
+        self.browser.navigate_to(full_url)
+        self._smart_wait()
+
+        # Handle captcha if it reappears
+        if self.browser.is_captcha_page():
+            logger.warning("reCAPTCHA on property page!")
+            self.browser.wait_for_captcha_solved(timeout=300)
+            self._smart_wait()
+
+        current = self.browser.get_current_url()
+        logger.info(f"  Current URL after navigation: {current}")
+        return current
+
+    # ─── Private helpers ──────────────────────────────────────
+
+    def _extract_total_results(self) -> None:
+        """
+        Extract the total number of search results from the funda search page.
+        
+        Funda shows something like "1.234 resultaten" or "456 woningen" on the 
+        search results page. We parse this to get the total count.
+        """
+        try:
+            # Try multiple strategies to find the result count
+            
+            # Strategy 1: Look for result count in page text via JS
+            count_js = """
+            // Try common selectors for result count
+            var selectors = [
+                '[data-test-id="result-count"]',
+                '.search-result-header h1',
+                '.search-output-result-count',
+                'h1.font-semibold',
+            ];
+            for (var s of selectors) {
+                var el = document.querySelector(s);
+                if (el && el.textContent) return el.textContent;
+            }
+            // Fallback: first h1 on the page
+            var h1 = document.querySelector('h1');
+            return h1 ? h1.textContent : '';
+            """
+            text = self.browser.execute_script(count_js) or ''
+            
+            # Extract number from text like "1.234 resultaten" or "456 koopwoningen"
+            match = re.search(r'([\d.]+)\s+(?:resulta|woning|koopwoning|huiz)', text, re.IGNORECASE)
+            if match:
+                count_str = match.group(1).replace('.', '')
+                self.total_search_results = int(count_str)
+                logger.info(f"  Total search results on funda: {self.total_search_results:,}")
+                return
+            
+            # Strategy 2: look for any large number followed by "resultaten" in page HTML
+            html = self.browser.get_page_source()
+            match = re.search(r'([\d.]+)\s+resultat', html, re.IGNORECASE)
+            if match:
+                count_str = match.group(1).replace('.', '')
+                self.total_search_results = int(count_str)
+                logger.info(f"  Total search results on funda: {self.total_search_results:,}")
+                return
+            
+            # Strategy 3: Count from pagination - find last page number
+            page_match = re.findall(r'page=(\d+)', html)
+            if page_match:
+                max_page = max(int(p) for p in page_match)
+                # Funda shows 15 results per page
+                self.total_search_results = max_page * 15
+                logger.info(f"  Estimated total results from pagination: ~{self.total_search_results:,}")
+                return
+                
+            logger.debug("  Could not determine total search results count")
+            
+        except Exception as e:
+            logger.debug(f"  Error extracting total results: {e}")
+
+    def _extract_properties_from_page(self) -> int:
+        """
+        Parse the current search results page and extract property IDs.
+
+        Uses DrissionPage's locator syntax to find links whose href
+        contains '/detail/koop/'.
+
+        Returns:
+            Number of NEW unique properties found on this page
+        """
+        new_count = 0
+
+        # Find all <a> links whose href contains /detail/koop/
+        links = self.browser.find_links_by_href('/detail/koop/')
+
+        # If nothing found, try broader pattern
+        if not links:
+            links = self.browser.find_links_by_href('/detail/')
+
+        # Collect unique hrefs
+        hrefs = set()
+        for link in links:
+            try:
+                href = link.attr('href') or ''
+                if href and '/detail/' in href:
+                    hrefs.add(href)
+            except Exception:
+                continue
+
+        logger.debug(f"  Raw detail links found: {len(hrefs)}")
+
+        # Extract IDs from hrefs
+        for href in sorted(hrefs):
+            funda_id = self._extract_id_from_url(href)
+            if funda_id and funda_id not in self._seen_ids:
+                self._seen_ids.add(funda_id)
+                address = self._extract_address_from_url(href)
+
+                self.collected.append({
+                    "id": funda_id,
+                    "url": href,
+                    "address": address,
+                })
+                new_count += 1
+                logger.debug(f"    + ID: {funda_id}  | {address}")
+
+                if len(self.collected) >= self.target_count:
+                    break
+
+        return new_count
+
+    def _extract_id_from_url(self, url: str) -> Optional[str]:
+        """
+        Extract numeric funda object ID from detail URL.
+
+        Example:
+            .../detail/koop/amsterdam/huis-straat-55/43358870/
+            -> '43358870'
+        """
+        if not url:
+            return None
+
+        match = FUNDA_ID_PATTERN.search(url)
+        if match:
+            return match.group(1)
+
+        # Fallback: last all-digit segment
+        path = urllib.parse.urlparse(url).path.rstrip('/')
+        for segment in reversed(path.split('/')):
+            if segment.isdigit() and 7 <= len(segment) <= 10:
+                return segment
+
+        return None
+
+    def _extract_address_from_url(self, url: str) -> str:
+        """
+        Best-effort address extraction from the URL slug.
+
+        /detail/koop/amsterdam/huis-hazelaarstraat-55/43358870/
+        -> 'amsterdam / huis-hazelaarstraat-55'
+        """
+        try:
+            path = urllib.parse.urlparse(url).path.strip('/')
+            parts = path.split('/')
+            if len(parts) >= 5:
+                return f"{parts[2]} / {parts[3]}"
+            elif len(parts) >= 4:
+                return parts[2]
+        except Exception:
+            pass
+        return ""
+
+    def _go_to_next_page(self, current_page: int) -> bool:
+        """
+        Navigate to the next page of search results.
+
+        Strategy 1: Click the "Volgende" link
+        Strategy 2: Construct URL with &page=N
+        """
+        # Strategy 1: Find and click "Volgende" (Next)
+        next_selectors = [
+            '@@tag()=a@@text()=Volgende',
+            '@@tag()=a@@attr(rel)=next',
+            '@@tag()=a@@attr(aria-label):Volgende',
+        ]
+
+        for sel in next_selectors:
+            try:
+                el = self.browser.find_element_safe(sel, timeout=3)
+                if not el:
+                    continue
+
+                # Verify it's forward (not "Vorige"/previous)
+                href = el.attr('href') or ''
+                if href and 'page=' in href:
+                    page_match = re.search(r'page=(\d+)', href)
+                    if page_match and int(page_match.group(1)) <= current_page:
+                        continue
+
+                self.browser.scroll_to_element(el)
+                time.sleep(0.5)
+
+                logger.info(f"  Clicking next page: {href or sel}")
+                el.click()
+                self._smart_wait()
+                return True
+
+            except Exception:
+                continue
+
+        # Strategy 2: Construct URL manually
+        next_page = current_page + 1
+        next_url = self._build_next_page_url(next_page)
+        if next_url:
+            logger.info(f"  Navigating to page {next_page}: {next_url}")
+            self.browser.navigate_to(next_url)
+            self._smart_wait()
+            return True
+
+        return False
+
+    def _build_next_page_url(self, page_number: int) -> Optional[str]:
+        """Build pagination URL with page= parameter."""
+        parsed = urllib.parse.urlparse(self.search_url)
+        params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+        params['page'] = [str(page_number)]
+        new_query = urllib.parse.urlencode(params, doseq=True)
+        return urllib.parse.urlunparse(
+            (parsed.scheme, parsed.netloc, parsed.path,
+             parsed.params, new_query, parsed.fragment)
+        )
+
+    def _smart_wait(self, max_wait: int = 20) -> None:
+        """Wait for page to fully load."""
+        try:
+            for _ in range(max_wait * 2):
+                state = self.browser.execute_script("return document.readyState")
+                if state == "complete":
+                    time.sleep(1)
+                    return
+                time.sleep(0.5)
+            logger.warning("Page did not reach 'complete' state in time")
+        except Exception:
+            time.sleep(2)

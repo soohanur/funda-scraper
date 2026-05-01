@@ -1,0 +1,16 @@
+# Excel Processing
+openpyxl==3.1.2
+
+# Browser Automation
+selenium==4.16.0
+webdriver-manager==4.0.1
+
+# Data Processing
+pandas==2.1.4
+
+# Logging and Utilities
+python-dotenv==1.0.0
+colorama==0.4.6
+
+# Optional: Alternative browser automation
+# playwright==1.40.0

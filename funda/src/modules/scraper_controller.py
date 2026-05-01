@@ -1,0 +1,1453 @@
+"""
+Funda Scraper Controller — Pipelined
+
+Architecture (v3 — Pipelined mode):
+  Collector thread: paginates search results, streams new IDs into work_queue
+  N worker threads: start after brief warmup, pull from the same queue
+  Writer thread:    writes to Google Sheets from a write queue
+
+  Collection and scraping run IN PARALLEL — total time ≈ max(collection, scraping)
+  instead of collection + scraping sequentially.
+
+Key optimizations:
+  - Pipelined: workers start scraping while collection is still gathering IDs
+  - Worker browsers persist — no open/close per batch
+  - Thread-safe agency cache — same agency scraped only once across all workers
+  - Reduced delays: 1-2s between properties
+  - No cooldown between batches (batching eliminated)
+"""
+import time
+import random
+import logging
+import threading
+import queue
+import shutil
+from enum import Enum
+from typing import Optional, Callable, Dict, Any, List
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from funda.src.config import config
+from funda.src.modules.browser_automation import BrowserAutomation
+from funda.src.modules.property_collector import PropertyCollector, CaptchaBlockedException
+from funda.src.modules.property_scraper import PropertyScraper
+from funda.src.modules.agency_scraper import AgencyScraper
+from funda.src.modules.excel_writer import ExcelWriter
+from funda.src.modules.kvk_storage import get_kvk_storage
+from funda.src.modules.sheets_writer import SheetsWriter
+from funda.src.modules.valuation_engine import ValuationEngine
+from funda.src.modules.walter_client import WalterClient
+
+logger = logging.getLogger('funda.controller')
+
+
+def create_browser(profile_path=None, headless=False, profile_name='Default', implicit_wait=10, port=9222):
+    """Factory function to create and start a browser instance."""
+    browser = BrowserAutomation(
+        profile_path=str(profile_path) if profile_path else None,
+        profile_name=profile_name,
+        headless=headless,
+        implicit_wait=implicit_wait,
+        port=port,
+    )
+    browser.start_browser()
+    return browser
+
+
+class ScraperStatus(str, Enum):
+    IDLE = "IDLE"
+    RUNNING = "RUNNING"
+    PAUSED = "PAUSED"
+    STOPPING = "STOPPING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+
+
+@dataclass
+class ScraperStats:
+    """Real-time scraper statistics."""
+    status: ScraperStatus = ScraperStatus.IDLE
+    
+    # Collection stats
+    total_kvk_stored: int = 0
+    kvk_collected_this_session: int = 0
+    total_search_results: int = 0
+    current_batch: int = 0
+    
+    # Scraping stats
+    properties_scraped: int = 0
+    properties_filtered: int = 0
+    properties_failed: int = 0
+    
+    # Progress (overall: done / total_search_results)
+    current_page: int = 0
+    total_pages_scraped: int = 0
+    batch_progress: int = 0
+    
+    # Collection real-time
+    collection_status: str = ""  # "collecting" | "done" | "error"
+    collection_page: int = 0
+    ids_collected: int = 0
+    ids_queued: int = 0
+    duplicate_in_storage: int = 0
+    duplicate_in_retry_queue: int = 0
+    
+    # Workers
+    active_workers: int = 0
+    
+    # Output
+    excel_files_created: int = 0
+    sheets_written: int = 0
+    valuations_written: int = 0
+    valuations_failed: int = 0
+    valuations_pending: int = 0
+    valuations_fallback: int = 0   # used asking-based formula (Walter unavailable)
+    
+    # Timing
+    start_time: float = 0.0
+    elapsed_seconds: float = 0.0
+    
+    # Error
+    last_error: str = ""
+    
+    # Recovery stats
+    browser_restarts: int = 0
+    consecutive_failures: int = 0
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for JSON serialization."""
+        return {
+            'status': self.status.value,
+            'total_kvk_stored': self.total_kvk_stored,
+            'kvk_collected_this_session': self.kvk_collected_this_session,
+            'total_search_results': self.total_search_results,
+            'current_batch': self.current_batch,
+            'properties_scraped': self.properties_scraped,
+            'properties_filtered': self.properties_filtered,
+            'properties_failed': self.properties_failed,
+            'current_page': self.current_page,
+            'total_pages_scraped': self.total_pages_scraped,
+            'batch_progress': self.batch_progress,
+            'collection_status': self.collection_status,
+            'collection_page': self.collection_page,
+            'ids_collected': self.ids_collected,
+            'ids_queued': self.ids_queued,
+            'duplicate_in_storage': self.duplicate_in_storage,
+            'duplicate_in_retry_queue': self.duplicate_in_retry_queue,
+            'active_workers': self.active_workers,
+            'excel_files_created': self.excel_files_created,
+            'sheets_written': self.sheets_written,
+            'valuations_written': self.valuations_written,
+            'valuations_failed': self.valuations_failed,
+            'valuations_pending': self.valuations_pending,
+            'valuations_fallback': self.valuations_fallback,
+            'elapsed_seconds': self.elapsed_seconds,
+            'last_error': self.last_error,
+            'browser_restarts': self.browser_restarts,
+            'consecutive_failures': self.consecutive_failures,
+        }
+
+
+class FundaController:
+    """
+    Main controller for Funda property scraper.
+    
+    Handles:
+    - Start/Stop/Pause/Resume operations
+    - Continuous scraping loop (collect → parallel scrape → repeat)
+    - 3 parallel worker threads with separate browsers
+    - Thread-safe Google Sheets writing via queue
+    - Real-time progress updates
+    """
+
+    def __init__(
+        self,
+        publication_date: int = 5,
+        on_progress: Optional[Callable[[ScraperStats], None]] = None,
+    ):
+        self.publication_date = publication_date
+        self.on_progress = on_progress
+        
+        # Internal state
+        self._thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+        self._pause_event = threading.Event()
+        self._pause_event.set()  # Not paused initially
+        
+        # Components
+        self.browser = None
+        self.collector = None
+        self.kvk_storage = get_kvk_storage()
+        
+        # Stats
+        self.stats = ScraperStats()
+        self._stats_lock = threading.Lock()
+        
+        # ── Shared CAPTCHA coordination ───────────────────────
+        # When ANY worker hits CAPTCHA, ALL workers stop + wipe + restart
+        self._captcha_event = threading.Event()      # Signals "CAPTCHA detected"
+        self._captcha_lock = threading.Lock()         # Prevents double-trigger
+        self._captcha_reset_event = threading.Event() # Signals "restart complete, resume"
+
+    @property
+    def search_url(self) -> str:
+        """Build search URL with a wide enough publication_date filter, sorted new→old.
+
+        IMPORTANT: We use sort="date_down" (newest first), not "date_up", because
+        Funda's date_up sort produces duplicate pages past ~page 1340 (every later
+        page returns the same content as the last real page). With date_down we
+        start at page 1 (= today) and walk forward to older listings — pagination
+        always returns fresh content on every page.
+        """
+        base = 'https://www.funda.nl/zoeken/koop'
+        funda_pub_date = config.FUNDA_PUB_DATE_PARAM.get(self.publication_date, 30)
+        if funda_pub_date == 0:
+            return f'{base}?selected_area=["nl"]&availability=["available"]&sort="date_down"'
+        return f'{base}?selected_area=["nl"]&publication_date={funda_pub_date}&availability=["available"]&sort="date_down"'
+
+    def _update_stats(self, **kwargs):
+        """Thread-safe stats update with overall progress calculation."""
+        with self._stats_lock:
+            for key, value in kwargs.items():
+                if hasattr(self.stats, key):
+                    setattr(self.stats, key, value)
+            
+            # Update elapsed time
+            if self.stats.start_time > 0:
+                self.stats.elapsed_seconds = time.time() - self.stats.start_time
+            
+            # Update total KVK count
+            self.stats.total_kvk_stored = self.kvk_storage.count()
+            
+            # Overall progress — only meaningful AFTER collection has finished.
+            # While collection is still running, ids_queued grows continuously,
+            # so any progress % computed mid-collection will yo-yo (it can hit
+            # 100% briefly when scraping catches up to whatever has been queued
+            # so far, then drop back to 50% when 100 more ids are added).
+            #
+            # Two-phase model: each property has TWO units of work — the scrape
+            # itself, and the Walter valuation. Run is only "done" when both
+            # phases are done for every queued property.
+            if self.stats.collection_status == "done" and self.stats.ids_queued > 0:
+                scrape_done = (
+                    self.stats.properties_scraped
+                    + self.stats.properties_filtered
+                    + self.stats.properties_failed
+                )
+                # valuation_pending properties are still in queue — count
+                # written + failed + fallback as "done" for valuation phase
+                valuation_done = (
+                    self.stats.valuations_written
+                    + self.stats.valuations_failed
+                )
+                total_work = self.stats.ids_queued * 2
+                done = scrape_done + valuation_done
+                self.stats.batch_progress = min(100, int(done / total_work * 100))
+            else:
+                # While collecting, show 0% — the dashboard label already
+                # reads "Collecting page X" in this state, which is more
+                # honest than a misleading number.
+                self.stats.batch_progress = 0
+            
+            # Notify callback
+            if self.on_progress:
+                try:
+                    self.on_progress(self.stats)
+                except Exception as e:
+                    logger.error(f"Progress callback error: {e}")
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get current stats as dictionary."""
+        with self._stats_lock:
+            # Compute elapsed time dynamically
+            if self.stats.start_time > 0 and self.stats.status in (ScraperStatus.RUNNING, ScraperStatus.PAUSED):
+                self.stats.elapsed_seconds = time.time() - self.stats.start_time
+            return self.stats.to_dict()
+
+    def start(self) -> bool:
+        """Start the scraping process in a background thread."""
+        if self._thread and self._thread.is_alive():
+            logger.warning("Scraper is already running")
+            return False
+
+        self._stop_event.clear()
+        self._pause_event.set()
+        
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+        
+        logger.info("Scraper started")
+        return True
+
+    def stop(self) -> bool:
+        """Stop the scraping process — kills everything immediately."""
+        if not self._thread or not self._thread.is_alive():
+            logger.warning("Scraper is not running")
+            return False
+
+        self._update_stats(status=ScraperStatus.STOPPING)
+        self._stop_event.set()
+        self._pause_event.set()
+        
+        logger.info("Stop signal sent — waiting for threads to finish...")
+
+        # Wait for the main thread (which joins all sub-threads) with a timeout
+        self._thread.join(timeout=30)
+
+        # Force-kill ALL Chrome processes (including collector) on full stop
+        self._kill_all_chrome(include_collector=True)
+
+        # Ensure status is IDLE after stop
+        if self._thread and not self._thread.is_alive():
+            self._update_stats(status=ScraperStatus.IDLE, active_workers=0)
+            logger.info("Scraper fully stopped")
+        else:
+            # Thread didn't die in 30s — force status anyway
+            self._update_stats(status=ScraperStatus.IDLE, active_workers=0)
+            logger.warning("Scraper thread still alive after 30s timeout — status forced to IDLE")
+
+        return True
+
+    def _kill_all_chrome(self, include_collector=False):
+        """Kill Chrome processes. By default only kills worker Chrome (port 9223+), not the collector (port 9222)."""
+        import subprocess
+        try:
+            if include_collector:
+                # Kill ALL Chrome — used when stopping scraper entirely
+                subprocess.run(
+                    ['pkill', '-9', '-f', 'chrome'],
+                    capture_output=True, timeout=10,
+                )
+                logger.info("All Chrome processes killed (including collector)")
+            else:
+                # Only kill worker Chrome processes (port 9223+)
+                # This preserves the collector browser on port 9222
+                for i in range(config.WORKER_COUNT):
+                    port = 9223 + i
+                    subprocess.run(
+                        ['pkill', '-9', '-f', f'remote-debugging-port={port}'],
+                        capture_output=True, timeout=5,
+                    )
+                logger.info(f"Worker Chrome processes killed (ports 9223-{9223 + config.WORKER_COUNT - 1})")
+        except Exception as e:
+            logger.warning(f"Failed to kill Chrome processes: {e}")
+
+    def pause(self) -> bool:
+        """Pause the scraping process."""
+        if not self._thread or not self._thread.is_alive():
+            return False
+        if self.stats.status != ScraperStatus.RUNNING:
+            return False
+        self._pause_event.clear()
+        self._update_stats(status=ScraperStatus.PAUSED)
+        logger.info("Scraper paused")
+        return True
+
+    def resume(self) -> bool:
+        """Resume the scraping process."""
+        if self.stats.status != ScraperStatus.PAUSED:
+            return False
+        self._pause_event.set()
+        self._update_stats(status=ScraperStatus.RUNNING)
+        logger.info("Scraper resumed")
+        return True
+
+    def is_running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def _check_stop(self) -> bool:
+        return self._stop_event.is_set()
+
+    def _wait_if_paused(self) -> bool:
+        while not self._pause_event.is_set():
+            if self._check_stop():
+                return True
+            time.sleep(0.1)
+        return self._check_stop()
+
+    def _restart_browser(self):
+        """Safely restart the collection browser."""
+        logger.info("Restarting browser...")
+        if self.browser:
+            try:
+                self.browser.close_browser()
+            except Exception:
+                pass
+        
+        time.sleep(3)
+        self.browser = create_browser(
+            profile_path=config.CHROME_PROFILE_PATH,
+            headless=config.HEADLESS,
+            implicit_wait=config.IMPLICIT_WAIT,
+        )
+        self._update_stats(browser_restarts=self.stats.browser_restarts + 1)
+        logger.info("Browser restarted successfully")
+
+    def _reconnect_sheets(self, sheets_writer):
+        """Reconnect Google Sheets if the connection has expired."""
+        try:
+            sheets_writer._client = None
+            sheets_writer._spreadsheet = None
+            sheets_writer._connect()
+            logger.info("Google Sheets reconnected successfully")
+            return True
+        except Exception as e:
+            logger.error(f"Google Sheets reconnection failed: {e}")
+            return False
+
+    def _is_browser_alive(self) -> bool:
+        if not self.browser:
+            return False
+        try:
+            return self.browser.is_alive()
+        except Exception:
+            return False
+
+    def _is_ip_blocked(self, browser=None) -> bool:
+        """Check if funda has blocked us. Only checks on funda.nl pages."""
+        b = browser or self.browser
+        if not b:
+            return False
+        try:
+            current_url = b.get_current_url() or ''
+            # Only check on funda.nl pages — external sites trigger false positives
+            if 'funda.nl' not in current_url:
+                return False
+            html = b.get_page_source()
+            # Funda-specific block markers only
+            funda_block_markers = [
+                'Je bent geblokkeerd',
+                'Je bent bijna op de pagina',
+                'Too Many Requests',
+                'Error 429',
+            ]
+            for marker in funda_block_markers:
+                if marker.lower() in html.lower():
+                    return True
+            return False
+        except Exception:
+            return False
+
+    @staticmethod
+    def _split_into_chunks(items: list, n: int) -> list:
+        """Split list into n roughly equal chunks."""
+        k, m = divmod(len(items), n)
+        return [items[i * k + min(i, m):(i + 1) * k + min(i + 1, m)] for i in range(n)]
+
+    def _create_worker_browser(self, worker_id: int):
+        """Create a browser for a worker thread with a unique port."""
+        worker_profile = f"{config.CHROME_PROFILE_PATH}_w{worker_id}"
+        worker_port = 9223 + worker_id  # 9223, 9224, etc.
+        browser = BrowserAutomation(
+            profile_path=worker_profile,
+            profile_name='Default',
+            headless=config.HEADLESS,
+            implicit_wait=config.IMPLICIT_WAIT,
+            port=worker_port,
+        )
+        # Don't kill other Chrome instances when starting worker browsers
+        browser._kill_stale_chrome = lambda: None
+        browser.start_browser()
+        return browser
+
+    def _wipe_all_worker_profiles(self):
+        """Delete all worker Chrome profile directories for a clean restart."""
+        for i in range(config.WORKER_COUNT):
+            profile_dir = Path(f"{config.CHROME_PROFILE_PATH}_w{i}")
+            if profile_dir.exists():
+                try:
+                    shutil.rmtree(profile_dir, ignore_errors=True)
+                    logger.info(f"  Wiped worker profile: {profile_dir}")
+                except Exception as e:
+                    logger.warning(f"  Failed to wipe profile {profile_dir}: {e}")
+
+    # ── Worker thread ─────────────────────────────────────────
+
+    def _worker_scrape(self, worker_id: int, work_queue: queue.Queue, write_queue: queue.Queue):
+        """
+        Worker thread: pulls properties from shared queue, scrapes with persistent browser.
+        
+        CAPTCHA handling:
+        - When ANY worker detects CAPTCHA, it sets _captcha_event
+        - ALL workers see the event, close their browser, and wait
+        - The triggering worker kills all Chrome, wipes all profiles, does cooldown
+        - After cooldown, all workers restart with fresh browsers
+        
+        Error handling:
+        - Browser crash: auto-restart with escalating cooldown
+        - IP block detection: long pause before retry
+        - Consecutive failure circuit breaker: 5+ failures → 2 min pause
+        - All exceptions caught — worker never crashes permanently
+        """
+        browser = None
+        scrape_count = 0
+        consecutive_fails = 0
+        restart_count = 0
+        MAX_CONSECUTIVE_FAILS = 5
+        MAX_RESTARTS_BEFORE_LONG_PAUSE = 3
+
+        try:
+            browser = self._create_worker_browser(worker_id)
+            scraper = PropertyScraper(browser=browser)
+            agency_scraper = AgencyScraper(browser=browser)
+
+            while True:
+                if self._check_stop():
+                    break
+
+                # ── Check if another worker triggered CAPTCHA restart ──
+                if self._captcha_event.is_set():
+                    logger.info(f"  [W{worker_id}] CAPTCHA event detected — closing browser and waiting...")
+                    try:
+                        browser.close_browser()
+                    except Exception:
+                        pass
+                    browser = None
+
+                    # Wait for the coordinated restart to complete
+                    while self._captcha_event.is_set() and not self._check_stop():
+                        time.sleep(1)
+
+                    if self._check_stop():
+                        break
+
+                    # Restart with fresh browser after wipe
+                    try:
+                        browser = self._create_worker_browser(worker_id)
+                        scraper = PropertyScraper(browser=browser)
+                        agency_scraper = AgencyScraper(browser=browser)
+                        logger.info(f"  [W{worker_id}] Fresh browser started after CAPTCHA reset")
+                    except Exception as e:
+                        logger.error(f"  [W{worker_id}] Failed to restart after CAPTCHA reset: {e}")
+                        time.sleep(10)
+                        continue
+
+                    consecutive_fails = 0
+                    restart_count = 0
+
+                # ── Circuit breaker: too many consecutive failures ──
+                if consecutive_fails >= MAX_CONSECUTIVE_FAILS:
+                    pause_time = 120  # 2 minutes
+                    logger.warning(
+                        f"  [W{worker_id}] Circuit breaker: {consecutive_fails} consecutive failures. "
+                        f"Pausing {pause_time}s..."
+                    )
+                    with self._stats_lock:
+                        self.stats.consecutive_failures = max(
+                            self.stats.consecutive_failures, consecutive_fails
+                        )
+                    self._update_stats()
+                    
+                    for _ in range(pause_time):
+                        if self._check_stop():
+                            break
+                        time.sleep(1)
+                    
+                    consecutive_fails = 0
+                    
+                    # Restart browser after circuit breaker pause
+                    try:
+                        if browser:
+                            browser.close_browser()
+                            browser.wipe_profile()
+                    except Exception:
+                        pass
+                    try:
+                        browser = self._create_worker_browser(worker_id)
+                        scraper = PropertyScraper(browser=browser)
+                        agency_scraper = AgencyScraper(browser=browser)
+                        logger.info(f"  [W{worker_id}] Browser restarted after circuit breaker pause")
+                    except Exception as e:
+                        logger.error(f"  [W{worker_id}] Browser restart failed after circuit breaker: {e}")
+                        time.sleep(30)
+                        continue
+
+                # Get next property from shared queue
+                try:
+                    prop_info = work_queue.get(timeout=5)
+                except queue.Empty:
+                    if self._check_stop():
+                        break
+                    continue
+
+                if prop_info is None:
+                    break  # Sentinel — no more work
+
+                # Skip if already scraped (dedup for collection retry duplicates)
+                if self.kvk_storage.exists(prop_info['id']):
+                    work_queue.task_done() if hasattr(work_queue, 'task_done') else None
+                    continue
+
+                if self._wait_if_paused():
+                    break
+
+                scrape_count += 1
+                logger.info(f"  [W{worker_id}] #{scrape_count}: {prop_info['address']}")
+
+                success = False
+                for attempt in range(1, config.MAX_RETRIES + 1):
+                    try:
+                        # ── Check browser health ──
+                        try:
+                            alive = browser.is_alive() if browser else False
+                        except Exception:
+                            alive = False
+
+                        if not alive:
+                            restart_count += 1
+                            cooldown = min(5 * restart_count, 30)
+                            logger.warning(
+                                f"  [W{worker_id}] Browser died (restart #{restart_count}) — "
+                                f"cooldown {cooldown}s..."
+                            )
+                            try:
+                                if browser:
+                                    browser.close_browser()
+                                    browser.wipe_profile()
+                            except Exception:
+                                pass
+                            
+                            for _ in range(cooldown):
+                                if self._check_stop():
+                                    break
+                                time.sleep(1)
+                            
+                            browser = self._create_worker_browser(worker_id)
+                            scraper = PropertyScraper(browser=browser)
+                            agency_scraper = AgencyScraper(browser=browser)
+                            self._update_stats(browser_restarts=self.stats.browser_restarts + 1)
+
+                            if restart_count >= MAX_RESTARTS_BEFORE_LONG_PAUSE:
+                                logger.warning(
+                                    f"  [W{worker_id}] {restart_count} restarts — taking 60s recovery break"
+                                )
+                                for _ in range(60):
+                                    if self._check_stop():
+                                        break
+                                    time.sleep(1)
+                                restart_count = 0
+
+                        # ── Scrape property ──
+                        result = scraper.scrape_property(prop_info)
+
+                        # ── CAPTCHA: trigger coordinated restart for ALL workers ──
+                        if result == 'captcha':
+                            logger.warning(
+                                f"  [W{worker_id}] CAPTCHA detected — triggering global restart for ALL workers"
+                            )
+                            # Re-queue the property (not lost)
+                            work_queue.put(prop_info)
+
+                            # Coordinate: only one worker does the kill+wipe+cooldown
+                            with self._captcha_lock:
+                                if not self._captcha_event.is_set():
+                                    self._captcha_event.set()
+                                    logger.info(f"  [W{worker_id}] CAPTCHA coordinator — killing all Chrome + wiping profiles...")
+
+                                    # Close own browser first
+                                    try:
+                                        browser.close_browser()
+                                    except Exception:
+                                        pass
+                                    browser = None
+
+                                    # Kill ALL Chrome processes
+                                    self._kill_all_chrome()
+                                    time.sleep(2)
+
+                                    # Wipe ALL worker profiles for clean start
+                                    self._wipe_all_worker_profiles()
+
+                                    # Cooldown so funda forgets us
+                                    cooldown_time = 90
+                                    logger.info(f"  [W{worker_id}] CAPTCHA cooldown {cooldown_time}s — all workers paused...")
+                                    for _ in range(cooldown_time):
+                                        if self._check_stop():
+                                            break
+                                        time.sleep(1)
+
+                                    self._update_stats(browser_restarts=self.stats.browser_restarts + config.WORKER_COUNT)
+
+                                    # Signal all workers to restart
+                                    self._captcha_event.clear()
+                                    logger.info(f"  [W{worker_id}] CAPTCHA cooldown complete — all workers restarting")
+                                else:
+                                    # Another worker already handling it
+                                    try:
+                                        browser.close_browser()
+                                    except Exception:
+                                        pass
+                                    browser = None
+
+                            # Wait for coordinator to finish (if we're not the coordinator)
+                            while self._captcha_event.is_set() and not self._check_stop():
+                                time.sleep(1)
+
+                            if self._check_stop():
+                                break
+
+                            # Restart with fresh browser
+                            try:
+                                browser = self._create_worker_browser(worker_id)
+                                scraper = PropertyScraper(browser=browser)
+                                agency_scraper = AgencyScraper(browser=browser)
+                                logger.info(f"  [W{worker_id}] Fresh browser started after CAPTCHA reset")
+                            except Exception as e:
+                                logger.error(f"  [W{worker_id}] Browser restart failed after CAPTCHA: {e}")
+                                time.sleep(30)
+
+                            consecutive_fails = 0
+                            restart_count = 0
+                            break  # Break retry loop, go to next queue item
+
+                        if result is None:
+                            # Price-filtered — do NOT add to KVK so we can
+                            # re-check this property if its price drops later
+                            with self._stats_lock:
+                                self.stats.properties_filtered += 1
+                            self._update_stats()
+                            logger.info(f"  [W{worker_id}]   Filtered (price threshold)")
+                            success = True
+                            break
+
+                        # ── Scrape agency info ──
+                        result = agency_scraper.scrape_agency(result)
+
+                        # Use listed_since from collector (search page date header)
+                        # instead of individual property page extraction
+                        if prop_info.get('listed_since'):
+                            result['listed_since'] = prop_info['listed_since']
+
+                        # Queue for sheets writing
+                        write_queue.put({
+                            'result': result,
+                            'prop_id': prop_info['id'],
+                            'worker_id': worker_id,
+                        })
+                        success = True
+                        break  # Success
+
+                    except Exception as e:
+                        logger.error(f"  [W{worker_id}] Attempt {attempt}/{config.MAX_RETRIES} failed: {e}")
+                        if attempt < config.MAX_RETRIES:
+                            backoff = random.uniform(3, 8) * attempt
+                            time.sleep(backoff)
+                        else:
+                            with self._stats_lock:
+                                self.stats.properties_failed += 1
+                            self._update_stats()
+
+                if success:
+                    consecutive_fails = 0
+                else:
+                    consecutive_fails += 1
+
+                # ── Anti-detection delays ──
+                # Use config values for base delay between properties
+                delay = random.uniform(config.MIN_DELAY_BETWEEN_PROPERTIES, config.MAX_DELAY_BETWEEN_PROPERTIES)
+                # Every 5th property, longer stealth pause
+                if scrape_count % 5 == 0:
+                    delay += random.uniform(5, 10)
+                # Every 20th property, major pause
+                if scrape_count % 20 == 0:
+                    delay += random.uniform(15, 30)
+                    logger.info(f"  [W{worker_id}] Stealth pause {delay:.0f}s after {scrape_count} properties")
+                time.sleep(delay)
+
+        except Exception as e:
+            logger.error(f"  [W{worker_id}] Fatal error: {e}", exc_info=True)
+        finally:
+            if browser:
+                try:
+                    browser.close_browser()
+                except Exception:
+                    pass
+            logger.info(f"  [W{worker_id}] Worker finished ({scrape_count} properties scraped)")
+
+    # ── Sheets writer thread ──────────────────────────────────
+
+    def _sheets_writer_thread(self, write_queue: queue.Queue, sheets_writer,
+                              stop_event: threading.Event,
+                              batch_results: list, results_lock: threading.Lock,
+                              valuation_queue: 'queue.Queue | None' = None):
+        """Dedicated writer thread — pops from queue, writes to Sheets one at a time.
+        After a successful sheet write, enqueues the row for the Walter worker
+        to compute and back-write the 4 valuation cells (G:J).
+        """
+        while not stop_event.is_set() or not write_queue.empty():
+            try:
+                item = write_queue.get(timeout=1)
+            except queue.Empty:
+                continue
+
+            if item is None:
+                break  # Sentinel
+
+            result = item['result']
+            prop_id = item['prop_id']
+
+            sheet_written = False
+            if sheets_writer:
+                for retry in range(2):
+                    try:
+                        sheet_written = sheets_writer.write_property(result, self.publication_date)
+                        if sheet_written:
+                            break
+                    except Exception as e:
+                        logger.warning(f"  [Writer] Sheets error (attempt {retry + 1}): {e}")
+                        if retry == 0:
+                            self._reconnect_sheets(sheets_writer)
+
+            if sheet_written:
+                self.kvk_storage.add(prop_id)
+                with self._stats_lock:
+                    self.stats.sheets_written += 1
+                    self.stats.properties_scraped += 1
+                    self.stats.total_kvk_stored = self.kvk_storage.count()
+                    if valuation_queue is not None:
+                        self.stats.valuations_pending += 1
+                self._update_stats()
+
+                with results_lock:
+                    batch_results.append(result)
+
+                logger.info(f"  [Writer] ✓ {result.get('address', '?')}")
+
+                # Hand off to Walter worker for valuation back-write.
+                if valuation_queue is not None:
+                    valuation_queue.put({
+                        'url':            result.get('url', ''),
+                        'address':        result.get('address', ''),
+                        'asking_price':   result.get('asking_price', ''),
+                        'days_on_market': result.get('days_on_market', ''),
+                        'postcode':       result.get('postcode', ''),
+                        'house_number':   result.get('house_number', ''),
+                        'house_addition': result.get('house_addition', ''),
+                    })
+            else:
+                with self._stats_lock:
+                    self.stats.properties_failed += 1
+                self._update_stats()
+                logger.error(f"  [Writer] ✗ Sheet write failed for {prop_id}")
+
+    # ── Walter valuation worker ───────────────────────────────
+
+    def _walter_worker_thread(self, valuation_queue: queue.Queue,
+                              sheets_writer,
+                              stop_event: threading.Event):
+        """Single-threaded Walter worker. Pulls rows freshly written to the
+        sheet, runs the ValuationEngine, and back-writes G:J on the same row.
+
+        Why single-threaded: Walter Living's chat UI is rate-limited and
+        captcha-prone. Running 1 session at a time is the safe default.
+        """
+        engine: 'ValuationEngine | None' = None
+        try:
+            engine = ValuationEngine()  # owns its own WalterClient
+            logger.info("  [Walter] Worker started — waiting for valuations to process")
+
+            while True:
+                # Drain even after stop is signalled, so already-scraped rows
+                # still get their valuation cells filled before we shut down.
+                if stop_event.is_set() and valuation_queue.empty():
+                    break
+
+                try:
+                    item = valuation_queue.get(timeout=1)
+                except queue.Empty:
+                    continue
+
+                if item is None:
+                    break  # Sentinel
+
+                url = item.get('url', '')
+                address = item.get('address', '?')
+
+                if self._check_stop():
+                    # Hard stop — drop pending valuations
+                    with self._stats_lock:
+                        self.stats.valuations_pending = max(0, self.stats.valuations_pending - 1)
+                    self._update_stats()
+                    continue
+
+                try:
+                    result = engine.value_property(item)
+                    logger.info(
+                        f"  [Walter] {address} → {result.reasoning} "
+                        f"(walter_reason={result.walter_reason}, conf={result.confidence})"
+                    )
+
+                    if not sheets_writer or not url:
+                        with self._stats_lock:
+                            self.stats.valuations_failed += 1
+                            self.stats.valuations_pending = max(0, self.stats.valuations_pending - 1)
+                        self._update_stats()
+                        continue
+
+                    # Skip back-write if confidence=NONE — nothing useful to write,
+                    # leave the row's valuation cells empty so a future pass can retry.
+                    if result.confidence == 'NONE':
+                        with self._stats_lock:
+                            self.stats.valuations_failed += 1
+                            self.stats.valuations_pending = max(0, self.stats.valuations_pending - 1)
+                        self._update_stats()
+                        logger.warning(f"  [Walter] {address}: NONE — leaving row blank for retry")
+                        continue
+
+                    ok = False
+                    for retry in range(2):
+                        try:
+                            ok = sheets_writer.update_valuation_row(url, result.as_sheet_dict())
+                            if ok:
+                                break
+                        except Exception as e:
+                            logger.warning(f"  [Walter] Sheets back-write error (attempt {retry+1}): {e}")
+                            if retry == 0:
+                                self._reconnect_sheets(sheets_writer)
+
+                    with self._stats_lock:
+                        if ok:
+                            self.stats.valuations_written += 1
+                            if result.confidence == 'FALLBACK':
+                                self.stats.valuations_fallback += 1
+                        else:
+                            self.stats.valuations_failed += 1
+                        self.stats.valuations_pending = max(0, self.stats.valuations_pending - 1)
+                    self._update_stats()
+
+                except Exception as e:
+                    logger.error(f"  [Walter] Valuation error for {address}: {e}", exc_info=True)
+                    with self._stats_lock:
+                        self.stats.valuations_failed += 1
+                        self.stats.valuations_pending = max(0, self.stats.valuations_pending - 1)
+                    self._update_stats()
+
+        except Exception as e:
+            logger.error(f"  [Walter] Fatal worker error: {e}", exc_info=True)
+        finally:
+            if engine is not None:
+                try:
+                    engine.close()
+                except Exception:
+                    pass
+            logger.info("  [Walter] Worker finished")
+
+    # ── Main loop ─────────────────────────────────────────────
+
+    def _run_loop(self):
+        """
+        Pipelined scraping: collection and scraping run in PARALLEL.
+        
+        - Collector thread pages through search results, streaming new IDs into work_queue
+        - Worker threads start after a brief warmup and pull from the same queue
+        - Total time ≈ max(collection, scraping) instead of collection + scraping
+        """
+        self.stats = ScraperStats(
+            status=ScraperStatus.RUNNING,
+            start_time=time.time(),
+            total_kvk_stored=self.kvk_storage.count(),
+        )
+        self._update_stats()
+        
+        worker_count = config.WORKER_COUNT
+        
+        try:
+            logger.info("=" * 60)
+            logger.info("  PIPELINED MODE: Collection + Scraping in parallel")
+            logger.info("=" * 60)
+            
+            # ── Shared queues ─────────────────────────────────
+            work_queue = queue.Queue()
+            write_queue = queue.Queue()
+            all_results = []
+            results_lock = threading.Lock()
+            collection_done = threading.Event()
+            collection_error = [None]  # Mutable container for error from thread
+            progress_state = {
+                'collected_offset': 0,
+                'queued_offset': 0,
+                'last_collected': 0,
+                'last_queued': 0,
+            }
+
+            # ── Collection thread ─────────────────────────────
+            def _on_collection_progress(
+                collected,
+                queued,
+                total_results,
+                page,
+                skipped_in_storage=0,
+                skipped_already_queued=0,
+            ):
+                """Called by collector every few pages with real-time stats."""
+                # Collector restarts from 0 on captcha retry. Keep counters monotonic
+                # so dashboard progress does not jump backwards mid-session.
+                if collected < progress_state['last_collected'] and progress_state['last_collected'] > 0:
+                    progress_state['collected_offset'] += progress_state['last_collected']
+                if queued < progress_state['last_queued'] and progress_state['last_queued'] > 0:
+                    progress_state['queued_offset'] += progress_state['last_queued']
+
+                effective_collected = progress_state['collected_offset'] + collected
+                effective_queued = progress_state['queued_offset'] + queued
+
+                progress_state['last_collected'] = collected
+                progress_state['last_queued'] = queued
+
+                with self._stats_lock:
+                    current_ids_collected = self.stats.ids_collected
+                    current_ids_queued = self.stats.ids_queued
+
+                self._update_stats(
+                    total_search_results=total_results,
+                    ids_collected=max(current_ids_collected, effective_collected),
+                    ids_queued=max(current_ids_queued, effective_queued),
+                    kvk_collected_this_session=max(current_ids_queued, effective_queued),
+                    # `duplicate_in_storage` is monotonic — these are TRUE duplicates
+                    # (already in permanent KVK from prior sessions), they don't
+                    # disappear when the collector retries.
+                    duplicate_in_storage=max(self.stats.duplicate_in_storage, skipped_in_storage),
+                    # `duplicate_in_retry_queue` is per-retry-attempt bookkeeping
+                    # (same property re-encountered after a crash). Use the latest
+                    # value, not max — so the count resets when the collector
+                    # restarts and isn't misleadingly cumulative across retries.
+                    duplicate_in_retry_queue=skipped_already_queued,
+                    collection_page=page,
+                    collection_status="collecting",
+                )
+
+            def _collection_thread():
+                """Runs collection in background, streaming IDs to work_queue.
+
+                Retries indefinitely on browser crashes / captcha until either:
+                  (a) collection completes naturally (3 'before' pages — we've
+                      walked through the whole target window), or
+                  (b) the user clicks Stop.
+
+                Backoff doubles each attempt, capped at 10 minutes.
+                """
+                queued_ids = set()       # Shared across retries — no double-queue
+                resume_page = None       # Resume point after a crash
+                collection_attempt = 0
+                completed_naturally = False
+                # Snapshot of KVK storage at session start. Properties this
+                # session's workers add to storage will NOT count as duplicates.
+                try:
+                    prior_storage_snapshot = set(self.kvk_storage.get_all())
+                    logger.info(f"  Session-start KVK snapshot: {len(prior_storage_snapshot)} ids")
+                except Exception:
+                    prior_storage_snapshot = set()
+
+                while not self._check_stop():
+                    try:
+                        self._update_stats(collection_status="collecting")
+                        if collection_attempt > 0:
+                            # Exponential backoff: 60s, 120s, 240s, 480s, 600s (cap)
+                            cooldown = min(60 * (2 ** (collection_attempt - 1)), 600)
+                            logger.info(
+                                f"  Collection retry attempt {collection_attempt} — "
+                                f"waiting {cooldown}s before retry "
+                                f"(resume from page {resume_page or 1})"
+                            )
+                            self._update_stats(collection_status=f"recovery_{collection_attempt}")
+                            for _ in range(cooldown):
+                                if self._check_stop():
+                                    break
+                                time.sleep(1)
+                            if self._check_stop():
+                                break
+
+                        logger.info("Starting Chrome browser for collection...")
+                        self.browser = create_browser(
+                            profile_path=config.CHROME_PROFILE_PATH,
+                            headless=config.HEADLESS,
+                            implicit_wait=config.IMPLICIT_WAIT,
+                        )
+
+                        date_range = config.DATE_RANGES.get(self.publication_date, (7, 3))
+
+                        self.collector = PropertyCollector(
+                            browser=self.browser,
+                            search_url=self.search_url,
+                            target_count=99999,
+                            min_page_delay=config.MIN_DELAY_BETWEEN_PAGES,
+                            max_page_delay=config.MAX_DELAY_BETWEEN_PAGES,
+                            on_progress=_on_collection_progress,
+                            stop_event=self._stop_event,
+                            date_range=date_range,
+                        )
+
+                        self.collector.collect_kvk_numbers(
+                            output_queue=work_queue,
+                            kvk_storage=self.kvk_storage,
+                            queued_ids=queued_ids,
+                            resume_from_page=resume_page,
+                            prior_storage_snapshot=prior_storage_snapshot,
+                        )
+
+                        # collect_kvk_numbers returned without raising → natural completion
+                        if self.collector.total_search_results > 0:
+                            effective_collected = progress_state['collected_offset'] + len(self.collector.collected)
+                            self._update_stats(
+                                total_search_results=self.collector.total_search_results,
+                                ids_collected=max(self.stats.ids_collected, effective_collected),
+                                ids_queued=max(self.stats.ids_queued, len(queued_ids)),
+                                kvk_collected_this_session=max(self.stats.ids_queued, len(queued_ids)),
+                                duplicate_in_storage=self.stats.duplicate_in_storage,
+                                duplicate_in_retry_queue=self.stats.duplicate_in_retry_queue,
+                                collection_status="done",
+                            )
+
+                        logger.info(
+                            f"  Collection finished naturally — {len(queued_ids)} unique IDs "
+                            f"queued, {len(self.collector.collected)} total seen"
+                        )
+                        completed_naturally = True
+                        break
+
+                    except CaptchaBlockedException as e:
+                        if self.collector and hasattr(self.collector, '_last_page'):
+                            resume_page = max(1, self.collector._last_page - 2)
+                        logger.warning(
+                            f"  Collection blocked by captcha (attempt #{collection_attempt+1}): "
+                            f"{e} — will resume from page {resume_page or 1}"
+                        )
+                        if self.browser:
+                            try:
+                                self.browser.close_browser()
+                            except Exception:
+                                pass
+                            try:
+                                self.browser.wipe_profile()
+                                logger.info("  Wiped collection Chrome profile for fresh start")
+                            except Exception as we:
+                                logger.warning(f"  Failed to wipe profile: {we}")
+                            self.browser = None
+                        self._wipe_all_worker_profiles()
+
+                    except Exception as e:
+                        if self.collector and hasattr(self.collector, '_last_page'):
+                            resume_page = max(1, self.collector._last_page - 2)
+                        logger.warning(
+                            f"  Collection crashed (attempt #{collection_attempt+1}, "
+                            f"{type(e).__name__}: {e}) — will resume from page "
+                            f"{resume_page or 1}"
+                        )
+                        if self.browser:
+                            try:
+                                self.browser.close_browser()
+                            except Exception:
+                                pass
+                            self.browser = None
+
+                    finally:
+                        if self.browser:
+                            try:
+                                self.browser.close_browser()
+                            except Exception:
+                                pass
+                            self.browser = None
+
+                    collection_attempt += 1
+                    # No max-attempt cap — keep retrying until completed_naturally
+                    # or the user stops. Each retry pays the exponential cooldown.
+
+                # If we exited the loop because the user stopped (not natural completion),
+                # leave collection_status as-is so the dashboard reflects what happened.
+                if not completed_naturally and self._check_stop():
+                    logger.info("  Collection halted by user stop")
+                collection_done.set()
+
+            coll_thread = threading.Thread(target=_collection_thread, daemon=True)
+            coll_thread.start()
+
+            # ── Wait briefly for collection warmup ────────────
+            # Let collection get ~2-3 pages of IDs (~30 properties) before starting workers
+            logger.info("  Waiting 45s for collection warmup before starting workers...")
+            for _ in range(45):
+                if self._check_stop() or collection_done.is_set():
+                    break
+                time.sleep(1)
+
+            if self._check_stop():
+                self._update_stats(status=ScraperStatus.IDLE)
+                return
+
+            if collection_done.is_set() and collection_error[0]:
+                self._update_stats(status=ScraperStatus.FAILED, last_error=collection_error[0])
+                return
+
+            queued_so_far = work_queue.qsize()
+            logger.info(f"  Collection warmup done — {queued_so_far} properties queued so far")
+
+            if queued_so_far == 0 and collection_done.is_set():
+                tsr = self.stats.total_search_results
+                dup_count = self.stats.duplicate_in_storage
+                # Three cases when collection is done with 0 queued:
+                #   (a) Funda returned 0 results in window → empty COMPLETED
+                #   (b) Funda returned N>0 results but all are already in KVK
+                #       storage → happy "fully caught up" COMPLETED
+                #   (c) Funda returned N>0 results, none are in storage either,
+                #       but date filter found 0 matches → BUG → FAILED with msg
+                if tsr == 0:
+                    logger.info("Collection finished with no new properties (empty result set)")
+                    self._update_stats(status=ScraperStatus.COMPLETED)
+                elif dup_count > 0:
+                    logger.info(
+                        f"Collection finished — all {dup_count} matching "
+                        f"properties were already in KVK storage. Nothing new to scrape."
+                    )
+                    self._update_stats(status=ScraperStatus.COMPLETED)
+                else:
+                    msg = (
+                        f"Collection finished with 0 properties queued, but "
+                        f"funda reports {tsr:,} total results in scope and 0 "
+                        f"matched our KVK storage. The date filter likely "
+                        f"didn't match any listing — Funda HTML may have changed."
+                    )
+                    logger.error(f"  {msg}")
+                    self._update_stats(status=ScraperStatus.FAILED, last_error=msg)
+                return
+
+            # ── Initialize Google Sheets ──────────────────────
+            sheets_writer = SheetsWriter()
+            try:
+                sheets_writer._connect()
+                logger.info("Google Sheets connected successfully")
+            except Exception as e:
+                logger.error(f"Google Sheets connection failed: {e}")
+                sheets_writer = None
+
+            # ── Start sheets writer thread + Walter valuation worker ──
+            valuation_queue: queue.Queue = queue.Queue()
+            writer_stop = threading.Event()
+            writer_thread = threading.Thread(
+                target=self._sheets_writer_thread,
+                args=(write_queue, sheets_writer, writer_stop, all_results,
+                      results_lock, valuation_queue),
+                daemon=True,
+            )
+            writer_thread.start()
+
+            walter_stop = threading.Event()
+            walter_thread = threading.Thread(
+                target=self._walter_worker_thread,
+                args=(valuation_queue, sheets_writer, walter_stop),
+                daemon=True,
+            )
+            walter_thread.start()
+
+            # ── Start persistent worker threads ───────────────
+            worker_threads = []
+            for i in range(worker_count):
+                if self._check_stop():
+                    break
+                if i > 0:
+                    stagger = random.uniform(5, 10)
+                    logger.info(f"  Stagger delay: {stagger:.0f}s before worker {i}...")
+                    time.sleep(stagger)
+                t = threading.Thread(
+                    target=self._worker_scrape,
+                    args=(i, work_queue, write_queue),
+                    daemon=True,
+                )
+                t.start()
+                worker_threads.append(t)
+                self._update_stats(active_workers=i + 1)
+                logger.info(f"  Worker {i} started (pulling from shared queue)")
+
+            # ── Monitor loop: wait for collection to finish + queue to drain ──
+            while not self._check_stop():
+                # Check if collection is done AND queue is empty
+                if collection_done.is_set() and work_queue.empty():
+                    # Send sentinel values to stop workers
+                    for _ in range(worker_count):
+                        work_queue.put(None)
+                    break
+                
+                # Check if all workers have died
+                alive_workers = sum(1 for t in worker_threads if t.is_alive())
+                if alive_workers == 0 and worker_threads:
+                    logger.error("  All worker threads have died! Stopping...")
+                    self._update_stats(
+                        last_error="All workers crashed",
+                        active_workers=0,
+                    )
+                    break
+                self._update_stats(active_workers=alive_workers)
+                
+                # Interruptible sleep so stop is responsive
+                for _ in range(3):
+                    if self._check_stop():
+                        break
+                    time.sleep(1)
+                
+                # Progress update
+                total_done = self.stats.properties_scraped + self.stats.properties_filtered
+                remaining = work_queue.qsize()
+                coll_status = "done" if collection_done.is_set() else "collecting"
+                
+                # Progress based on ids_queued (not total_search_results)
+                self._update_stats()
+                
+                if total_done % 20 < 3:  # Log every ~20 properties
+                    logger.info(
+                        f"  Pipeline: scraped={total_done} | queued={remaining} | "
+                        f"workers={alive_workers}/{worker_count} | collection={coll_status}"
+                    )
+
+            # If stopped early, send sentinels
+            if self._check_stop():
+                for _ in range(worker_count):
+                    work_queue.put(None)
+
+            # Wait for all workers to finish.
+            # Stop button: short timeout so /stop is responsive.
+            # Normal completion: NO timeout — let every worker finish its
+            # current property naturally, no matter how long the queue.
+            if self._check_stop():
+                for t in worker_threads:
+                    t.join(timeout=10)
+            else:
+                for t in worker_threads:
+                    t.join()  # block forever until done
+
+            # Wait for collection thread if still running
+            coll_thread.join(timeout=10)
+
+            self._update_stats(active_workers=0)
+
+            # Signal writer thread to drain and stop
+            writer_stop.set()
+            write_queue.put(None)
+            # Writer is fast (just sheet API calls) — 60s is enough on stop,
+            # unlimited on normal completion.
+            writer_thread.join(timeout=60 if self._check_stop() else None)
+
+            # ── Drain Walter worker ───────────────────────────
+            # Writer is done — no more rows will be enqueued for valuation.
+            # Walter worker keeps running until valuation_queue is empty.
+            # Stop button: 15s force-cut. Normal completion: NO timeout —
+            # Walter is the slow path, every row in the queue MUST get its
+            # valuation cells filled before we declare COMPLETED.
+            walter_stop.set()
+            valuation_queue.put(None)
+            if self._check_stop():
+                walter_thread.join(timeout=15)
+            else:
+                walter_thread.join()  # block forever until queue drained
+
+            # ── Write Excel output ────────────────────────────
+            with results_lock:
+                if all_results:
+                    logger.info("Writing Excel output...")
+                    writer = ExcelWriter(output_dir=config.OUTPUT_DIR)
+                    excel_path = writer.write(list(all_results))
+                    logger.info(f"  ✓ Excel: {excel_path}")
+                    self._update_stats(excel_files_created=self.stats.excel_files_created + 1)
+
+            # ── COMPLETION ─────────────────────────────────────
+            total_collected = len(self.collector.collected) if self.collector else 0
+
+            if self._check_stop():
+                self._update_stats(status=ScraperStatus.IDLE)
+                logger.info("Scraper stopped by user")
+            else:
+                # Explicit guard: never declare COMPLETED with valuations still
+                # pending. walter_thread.join() should have already drained the
+                # queue, but if for some reason it didn't (browser stuck mid-call),
+                # fall through to FAILED so the user knows valuations are missing.
+                pending = self.stats.valuations_pending
+                if pending > 0:
+                    msg = (
+                        f"Scrape finished but {pending} valuation(s) are still "
+                        f"pending — Walter worker did not drain its queue."
+                    )
+                    logger.error(f"  {msg}")
+                    self._update_stats(status=ScraperStatus.FAILED, last_error=msg)
+                else:
+                    self._update_stats(status=ScraperStatus.COMPLETED)
+                    logger.info("Scraper completed - all properties processed (incl. valuations)!")
+
+            logger.info(f"\n{'=' * 60}")
+            logger.info("  FINAL SUMMARY")
+            logger.info(f"{'=' * 60}")
+            logger.info(f"  IDs collected        : {total_collected}")
+            logger.info(f"  KVKs in storage      : {self.kvk_storage.count()}")
+            logger.info(f"  Properties scraped   : {self.stats.properties_scraped}")
+            logger.info(f"  Properties filtered  : {self.stats.properties_filtered}")
+            logger.info(f"  Properties failed    : {self.stats.properties_failed}")
+            logger.info(f"  Valuations written   : {self.stats.valuations_written}")
+            logger.info(f"  Valuations fallback  : {self.stats.valuations_fallback}")
+            logger.info(f"  Valuations failed    : {self.stats.valuations_failed}")
+            logger.info(f"  Excel files created  : {self.stats.excel_files_created}")
+            logger.info(f"  Browser restarts     : {self.stats.browser_restarts}")
+            logger.info(f"  Total time           : {self.stats.elapsed_seconds:.1f}s")
+            logger.info(f"{'=' * 60}")
+
+        except Exception as e:
+            logger.error(f"Fatal error: {e}", exc_info=True)
+            self._update_stats(status=ScraperStatus.FAILED, last_error=str(e))
+
+        finally:
+            if self.browser:
+                try:
+                    self.browser.close_browser()
+                except:
+                    pass
+
+
+# ── Global controller instance for API use ─────────────────────
+_controller: Optional[FundaController] = None
+_controller_lock = threading.Lock()
+
+
+def get_controller() -> Optional[FundaController]:
+    """Get the current controller instance."""
+    return _controller
+
+
+def start_scraper(
+    publication_date: int = 5,
+    on_progress: Optional[Callable[[ScraperStats], None]] = None,
+) -> FundaController:
+    """Start a new scraper controller."""
+    global _controller
+    
+    with _controller_lock:
+        if _controller and _controller.is_running():
+            raise RuntimeError("Scraper is already running")
+        
+        _controller = FundaController(
+            publication_date=publication_date,
+            on_progress=on_progress,
+        )
+        _controller.start()
+        return _controller
+
+
+def stop_scraper() -> bool:
+    """Stop the current scraper."""
+    if _controller:
+        return _controller.stop()
+    return False
+
+
+def pause_scraper() -> bool:
+    """Pause the current scraper."""
+    if _controller:
+        return _controller.pause()
+    return False
+
+
+def resume_scraper() -> bool:
+    """Resume the current scraper."""
+    if _controller:
+        return _controller.resume()
+    return False
+
+
+def get_scraper_stats() -> Dict[str, Any]:
+    """Get current scraper stats."""
+    if _controller:
+        return _controller.get_stats()
+    return ScraperStats().to_dict()

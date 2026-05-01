@@ -1,0 +1,38 @@
+# Environment & credentials
+.env
+.env.*
+!.env.example
+*.json
+!package.json
+!package-lock.json
+!tsconfig*.json
+
+# Chrome browser profiles (large & private)
+chrome_profiles/
+funda/chrome_profile*/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+*.egg-info/
+
+# Logs & data output
+logs/
+*.log
+funda/data/
+funda/csv_files/
+
+# Node
+node_modules/
+
+# IDE & tools
+.vscode/
+.claude/
+.idea/
+
+# Build output
+dist/
+build/
