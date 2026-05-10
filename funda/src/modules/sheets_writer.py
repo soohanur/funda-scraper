@@ -38,7 +38,6 @@ COLUMNS = [
     ('WOZ Value (\u20ac)',           120),
     ('Suggested Bid (\u20ac)',       130),
     ('Bidding Price',                 130),
-    ('Bid Confidence',                110),
     ('Price / m\u00b2 (\u20ac)',    100),
     ('Living Area (m\u00b2)',        110),
     ('Plot Area (m\u00b2)',          100),
@@ -307,7 +306,6 @@ class SheetsWriter:
                 prop.get('woz_value', ''),
                 prop.get('suggested_bid', ''),
                 '',                                # Bidding Price — EMPTY for user
-                prop.get('bid_confidence', ''),
                 prop.get('price_per_m2', '') or '',
                 prop.get('living_area', '') or '',
                 prop.get('plot_area', '') or '',
@@ -353,12 +351,12 @@ class SheetsWriter:
 
     # ── Valuation back-write ──────────────────────────────────
 
-    # Column letters for the post-Walter layout.
-    # G=WOZ, H=Suggested Bid, I=Bidding Price (HUMAN, never written), J=Bid Confidence
-    _VAL_COL_WOZ        = 'G'   # 7  — WOZ Value
-    _VAL_COL_SUGGESTED  = 'H'   # 8  — Suggested Bid
-    _VAL_COL_BIDDING    = 'I'   # 9  — Bidding Price (HUMAN, empty)
-    _VAL_COL_CONFIDENCE = 'J'   # 10 — Bid Confidence
+    # Column letters for the post-Walter, post-Confidence layout (33 cols).
+    # G=WOZ, H=Suggested Bid, I=Bidding Price (HUMAN, never written).
+    # No Bid Confidence column — confidence still computed for logging only.
+    _VAL_COL_WOZ        = 'G'   # 7 — WOZ Value
+    _VAL_COL_SUGGESTED  = 'H'   # 8 — Suggested Bid
+    _VAL_COL_BIDDING    = 'I'   # 9 — Bidding Price (HUMAN, empty)
     _IDX_WOZ            = 6     # 0-based index for "is this row valued yet?" check
     _IDX_WALTER         = 6     # back-compat alias
 
@@ -418,11 +416,11 @@ class SheetsWriter:
     def update_valuation_row(self, url: str, valuation: dict, find_retries: int = 3) -> bool:
         """Back-write valuation cells for the row matching `url`.
 
-        Writes G:H + J separately so the human-controlled Bidding Price
-        column (I) is NEVER touched:
+        Writes only G:H so the human-controlled Bidding Price column (I) is
+        NEVER touched:
             G:H → WOZ Value, Suggested Bid
-            J   → Bid Confidence
-        `valuation` keys: woz_value, suggested_bid, bid_confidence.
+        `valuation` keys: woz_value, suggested_bid.
+        (bid_confidence is no longer written to the sheet — kept in logs only.)
         """
         import time
         loc = None
@@ -444,21 +442,13 @@ class SheetsWriter:
             return False
         ws, row_num = loc
         try:
-            ws.batch_update([
-                {
-                    'range':  f'{self._VAL_COL_WOZ}{row_num}:{self._VAL_COL_SUGGESTED}{row_num}',
-                    'values': [[
-                        valuation.get('woz_value', '')      or '',
-                        valuation.get('suggested_bid', '')  or '',
-                    ]],
-                },
-                {
-                    'range':  f'{self._VAL_COL_CONFIDENCE}{row_num}:{self._VAL_COL_CONFIDENCE}{row_num}',
-                    'values': [[
-                        valuation.get('bid_confidence', '') or '',
-                    ]],
-                },
-            ], value_input_option='USER_ENTERED')
+            ws.batch_update([{
+                'range':  f'{self._VAL_COL_WOZ}{row_num}:{self._VAL_COL_SUGGESTED}{row_num}',
+                'values': [[
+                    valuation.get('woz_value', '')      or '',
+                    valuation.get('suggested_bid', '')  or '',
+                ]],
+            }], value_input_option='USER_ENTERED')
             logger.info(f"  ✓ Valuation written [{ws.title} row {row_num}]: {url}")
             return True
         except Exception as e:

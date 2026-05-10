@@ -192,13 +192,13 @@ class ValuationResult:
 
     def as_sheet_dict(self) -> Dict:
         """Flatten for sheets_writer back-write.
-        Returns the 3 cells we write — `bidding_price` (col I) is left empty
-        for the user to fill in.
+        Returns the 2 cells we write (G + H). Bidding Price (col I) stays
+        empty for the user. Confidence stays on the dataclass for logging
+        but is not written to the sheet anymore.
         """
         return {
             'woz_value':       self.woz_value or '',
             'suggested_bid':   self.suggested_bid or '',
-            'bid_confidence':  self.confidence,
         }
 
 
