@@ -35,9 +35,9 @@ COLUMNS = [
     ('Listed Since',                  95),
     ('Days on Market',                95),
     ('Asking Price (\u20ac)',        120),
-    ('Walter Play-it-Safe (\u20ac)', 150),
     ('WOZ Value (\u20ac)',           120),
     ('Suggested Bid (\u20ac)',       130),
+    ('Bidding Price',                 130),
     ('Bid Confidence',                110),
     ('Price / m\u00b2 (\u20ac)',    100),
     ('Living Area (m\u00b2)',        110),
@@ -303,10 +303,10 @@ class SheetsWriter:
                 prop.get('listed_since', ''),
                 prop.get('days_on_market', '') or '',
                 prop.get('asking_price', '') or '',
-                # Valuation cells — filled by Walter worker thread in parallel
-                prop.get('walter_play_it_safe', ''),
+                # Valuation cells — filled by valuation worker (Walter-free)
                 prop.get('woz_value', ''),
                 prop.get('suggested_bid', ''),
+                '',                                # Bidding Price — EMPTY for user
                 prop.get('bid_confidence', ''),
                 prop.get('price_per_m2', '') or '',
                 prop.get('living_area', '') or '',
@@ -353,13 +353,14 @@ class SheetsWriter:
 
     # ── Valuation back-write ──────────────────────────────────
 
-    # Column letters for the 4 machine-written valuation cells.
-    # New 34-col layout: no Bidding Price column, no Reasoning column.
-    _VAL_COL_WALTER     = 'G'   # 7  — Walter Play-it-Safe
-    _VAL_COL_WOZ        = 'H'   # 8  — WOZ Value
-    _VAL_COL_SUGGESTED  = 'I'   # 9  — Suggested Bid
+    # Column letters for the post-Walter layout.
+    # G=WOZ, H=Suggested Bid, I=Bidding Price (HUMAN, never written), J=Bid Confidence
+    _VAL_COL_WOZ        = 'G'   # 7  — WOZ Value
+    _VAL_COL_SUGGESTED  = 'H'   # 8  — Suggested Bid
+    _VAL_COL_BIDDING    = 'I'   # 9  — Bidding Price (HUMAN, empty)
     _VAL_COL_CONFIDENCE = 'J'   # 10 — Bid Confidence
-    _IDX_WALTER         = 6     # 0-based index in a row list
+    _IDX_WOZ            = 6     # 0-based index for "is this row valued yet?" check
+    _IDX_WALTER         = 6     # back-compat alias
 
     def find_row_by_url(self, url: str) -> Optional[tuple]:
         """Locate a property row across all tabs by its Funda URL (col B).
@@ -417,17 +418,11 @@ class SheetsWriter:
     def update_valuation_row(self, url: str, valuation: dict, find_retries: int = 3) -> bool:
         """Back-write valuation cells for the row matching `url`.
 
-        Writes a single contiguous G:J range:
-            G → Walter Play-it-Safe
-            H → WOZ Value
-            I → Suggested Bid
-            J → Bid Confidence
-        `valuation` keys: walter_play_it_safe, woz_value, suggested_bid,
-                          bid_confidence.
-
-        Retries find_row_by_url up to `find_retries` times with 3s backoff —
-        the sheet API has eventual consistency and a freshly-written row may
-        not show up in `col_values()` for a few seconds.
+        Writes G:H + J separately so the human-controlled Bidding Price
+        column (I) is NEVER touched:
+            G:H → WOZ Value, Suggested Bid
+            J   → Bid Confidence
+        `valuation` keys: woz_value, suggested_bid, bid_confidence.
         """
         import time
         loc = None
@@ -449,15 +444,21 @@ class SheetsWriter:
             return False
         ws, row_num = loc
         try:
-            ws.batch_update([{
-                'range':  f'{self._VAL_COL_WALTER}{row_num}:{self._VAL_COL_CONFIDENCE}{row_num}',
-                'values': [[
-                    valuation.get('walter_play_it_safe', '') or '',
-                    valuation.get('woz_value', '')           or '',
-                    valuation.get('suggested_bid', '')       or '',
-                    valuation.get('bid_confidence', '')      or '',
-                ]],
-            }], value_input_option='USER_ENTERED')
+            ws.batch_update([
+                {
+                    'range':  f'{self._VAL_COL_WOZ}{row_num}:{self._VAL_COL_SUGGESTED}{row_num}',
+                    'values': [[
+                        valuation.get('woz_value', '')      or '',
+                        valuation.get('suggested_bid', '')  or '',
+                    ]],
+                },
+                {
+                    'range':  f'{self._VAL_COL_CONFIDENCE}{row_num}:{self._VAL_COL_CONFIDENCE}{row_num}',
+                    'values': [[
+                        valuation.get('bid_confidence', '') or '',
+                    ]],
+                },
+            ], value_input_option='USER_ENTERED')
             logger.info(f"  ✓ Valuation written [{ws.title} row {row_num}]: {url}")
             return True
         except Exception as e:

@@ -1,137 +1,151 @@
 """
-Valuation Engine — Walter-only ceiling, fixed discount X ∈ [0%, 3%]
+Valuation Engine — Walter-free, distribution-based bidding model.
 
-Bid model:
-    suggested_bid = round(walter_price × (1 − X))
+The model is reverse-engineered from 324 historical successful deals.
+Inputs: asking price, WOZ value (proxy for market value), days on market,
+city, postcode/house number for WOZ lookup.
 
-X is a discount in [0, 3%], composed of three independent parts:
+Pipeline per property:
 
-    X = DOM_part + region_part + spread_part           (clamped to [0, 0.03])
+  1. Estimate market value (MV)
+       - if WOZ available: MV ≈ WOZ × WOZ_TO_MV_UPLIFT (NL avg ~+8%)
+       - else fallback:    MV ≈ asking × ASK_TO_MV_DEFAULT (~+2.5%)
 
-  DOM_part           — how stale the listing is (max 1.5%)
-    ≤ 7 days   → 0.0%
-    8–14 days  → 0.5%
-    15–30 days → 1.0%
-    31–60 days → 1.3%
-    > 60 days  → 1.5%
+  2. Classify into segments
+       - ask_band     : <200k | 200-300k | 300-400k | 400-600k | >600k
+       - mv_spread    : (mv - asking) / asking
+       - spread_band  : overpriced | fair | underpriced | badly_underpriced
+       - dom_band     : fresh<=14 | normal15-30 | cooling31-60 | stale>60
 
-  region_part        — postcode prefix heat (max 1.0%)
-    10/11/12/20/30/31/35  → 0.0%   (Amsterdam / Rotterdam / Utrecht — hot)
-    21/25/26              → 0.5%   (Haarlem / Den Haag — warm)
-    anything else         → 1.0%
+  3. Lookup conditional discount distribution from DISCOUNT_TABLE:
+       returns (P25, P50, P75) of historical discount % for that segment
 
-  spread_part        — Walter-vs-asking headroom (max 0.5%)
-    spread ≤ 5%   → 0.0%
-    5–15%         → 0.25%
-    > 15%         → 0.5%
-    asking missing OR walter ≤ asking → 0%
+  4. Pick a recommendation pointer using DOM:
+       - DOM ≤ 14 → use P75 (aggressive — fresh listings give biggest margin)
+       - DOM 15-60 → use P50 (balanced — default)
+       - DOM > 60 → use P25 (conservative — seller likely already trimmed)
 
-Fallback path (only when Walter genuinely returns reason='no_data'):
-    The same X formula is applied to `asking` instead of Walter:
-        suggested_bid = round(asking × (1 − X))
-        spread_part = 0 (Walter is unavailable)
-    Walter Play-it-Safe stays empty in the sheet.
-    Bid Confidence = 'FALLBACK' (clearly distinct from HIGH/MEDIUM/LOW).
+  5. Compute bid:  bid = round(asking × (1 - discount/100))
 
-Walter retry policy (handled here, not in the controller):
-    captcha / no_chat / login_failed / send_failed / parse_failed
-                 → close Walter, sleep 60s, restart, retry the same address
-                   once. If the retry also fails: behave per reason as below.
-    captcha (2nd time)        → fall back via asking-based formula
-                                (so the queue keeps moving even if Walter is
-                                 blocked — flagged with 'FALLBACK' confidence)
-    timeout / error           → skip property (NONE confidence)
-    no_data                   → asking-based fallback formula immediately
+  6. Apply hard guardrails:
+       - bid ≤ MV × MV_GUARD (never within MV_GUARD of estimated MV)
+       - bid ≥ asking × MIN_RATIO_TO_ASK (never insultingly low)
+
+  7. Lookup risk profile from RISK_TABLE → confidence label:
+       - P(margin <5%) ≥ 30%        → SKIP
+       - P(margin ≥20%) ≥ 50%       → HIGH
+       - P(margin ≥20%) ≥ 25%       → MEDIUM
+       - else                        → LOW
+
+Returns: woz_value, suggested_bid, bid_confidence (no Walter price).
+The "Bidding Price" column on the sheet stays empty — that's for the user.
 """
 import re
-import time
 from typing import Optional, Dict
 from dataclasses import dataclass, field
 
 from ..config import config
 from ..utils.logger import setup_logger
-from .walter_client import (
-    WalterClient,
-    REASON_OK, REASON_NO_DATA, REASON_CAPTCHA, REASON_NO_CHAT,
-    REASON_LOGIN_FAILED, REASON_TIMEOUT, REASON_SEND_FAILED,
-    REASON_PARSE_FAILED, REASON_ERROR,
-)
 from . import woz_client
 
 logger = setup_logger('funda.valuation')
 
 
 # ─────────────────────────────────────────────────────────────────
-# Tunables
+# MV estimation knobs
 # ─────────────────────────────────────────────────────────────────
-MAX_DISCOUNT = 0.03         # cap X at 3%
+WOZ_TO_MV_UPLIFT     = 1.08   # WOZ is ~5-15% below MV in rising markets; 8% is conservative
+ASK_TO_MV_DEFAULT    = 1.025  # historical median MV/Ask ratio when WOZ missing
+MV_GUARD             = 0.92   # bid never within 8% of MV
+MIN_RATIO_TO_ASK     = 0.55   # bid never below 55% of asking (insulting)
 
-# DOM bands — (upper bound days inclusive, discount fraction)
-_DOM_TIERS = [
-    (7,    0.0000),
-    (14,   0.0050),
-    (30,   0.0100),
-    (60,   0.0130),
-    (10**9, 0.0150),
-]
 
-# Postcode-prefix region tiers
-_HOT_REGIONS  = {'10', '11', '12', '20', '30', '31', '35'}
-_WARM_REGIONS = {'21', '25', '26'}
-
-# Walter-vs-asking spread bands — (upper bound spread fraction, discount fraction)
-_SPREAD_TIERS = [
-    (0.05,   0.0000),
-    (0.15,   0.0025),
-    (10.0,   0.0050),
-]
-
-# Walter retry behaviour. REASON_ERROR is included because most "errors" we
-# see in practice are PageDisconnectedError / ChromeDriver crashes, which a
-# fresh browser session (close + restart) reliably resolves. REASON_TIMEOUT
-# is included because hung sessions are usually freed by a browser restart.
-_WALTER_RECOVERABLE = {
-    REASON_CAPTCHA, REASON_NO_CHAT, REASON_LOGIN_FAILED,
-    REASON_SEND_FAILED, REASON_PARSE_FAILED, REASON_ERROR,
-    REASON_TIMEOUT,
+# ─────────────────────────────────────────────────────────────────
+# DISCOUNT_TABLE — derived from 324 historical winning deals.
+# Format: DISCOUNT_TABLE[ask_band][spread_band] = (P25, P50, P75)
+# Discount values are PERCENTAGES below asking price.
+# ─────────────────────────────────────────────────────────────────
+DISCOUNT_TABLE = {
+    '<200k': {
+        'overpriced':        (14.01, 17.76, 23.31),
+        'fair':              (11.61, 14.91, 20.53),
+        'underpriced':       (12.37, 16.32, 20.44),
+        'badly_underpriced': (13.81, 19.58, 25.50),
+    },
+    '200-300k': {
+        'overpriced':        (8.78, 16.00, 25.00),
+        'fair':              (10.56, 13.21, 19.68),
+        'underpriced':       (7.95, 11.11, 15.56),
+        'badly_underpriced': (6.22, 11.32, 16.00),
+    },
+    '300-400k': {
+        'overpriced':        (9.80, 18.55, 20.00),
+        'fair':              (6.56, 11.73, 16.35),
+        'underpriced':       (6.67, 9.33, 13.33),
+        'badly_underpriced': (4.17, 8.00, 12.70),
+    },
+    '400-600k': {
+        'overpriced':        (9.79, 14.79, 17.94),
+        'fair':              (6.25, 9.24, 12.50),
+        'underpriced':       (6.90, 8.24, 10.59),
+        'badly_underpriced': (1.65, 6.25, 7.06),
+    },
+    '>600k': {
+        'overpriced':        (11.62, 11.73, 14.49),
+        'fair':              (7.98, 13.20, 15.56),
+        'underpriced':       (7.98, 13.20, 15.56),   # reuse fair (low n in this segment)
+        'badly_underpriced': (7.98, 13.20, 15.56),
+    },
 }
-_WALTER_RETRY_SLEEP_SEC = 60   # cooldown before retrying after captcha/etc
 
-# Politeness delay between consecutive Walter queries. Walter Living's chat is
-# LLM-backed and rate-limits aggressive use. We use a JITTERED range so we
-# don't look like a periodic bot.
-_WALTER_DELAY_MIN_SEC = 8
-_WALTER_DELAY_MAX_SEC = 25
-_WALTER_PRESEND_MIN_SEC = 1.0     # extra random pause right before sending prompt
-_WALTER_PRESEND_MAX_SEC = 3.0
+# RISK_TABLE[ask_band][spread_band] = (P_loss, P_thin, P_good)
+# P_loss = % of historical deals with margin < 5%
+# P_thin = % of historical deals with margin < 10%
+# P_good = % of historical deals with margin >= 20%
+RISK_TABLE = {
+    '<200k': {
+        'overpriced':        (25.0, 50.0, 25.0),
+        'fair':              (8.7, 21.7, 39.1),
+        'underpriced':       (0.0, 0.0, 70.0),
+        'badly_underpriced': (0.0, 0.0, 83.3),
+    },
+    '200-300k': {
+        'overpriced':        (42.9, 42.9, 28.6),
+        'fair':              (9.1, 27.3, 33.3),
+        'underpriced':       (2.8, 16.7, 44.4),
+        'badly_underpriced': (3.0, 3.0, 81.8),
+    },
+    '300-400k': {
+        'overpriced':        (40.0, 60.0, 20.0),
+        'fair':              (23.5, 38.2, 26.5),
+        'underpriced':       (11.9, 21.4, 35.7),
+        'badly_underpriced': (0.0, 0.0, 76.5),
+    },
+    '400-600k': {
+        'overpriced':        (50.0, 50.0, 0.0),
+        'fair':              (20.7, 55.2, 13.8),
+        'underpriced':       (0.0, 9.5, 14.3),
+        'badly_underpriced': (0.0, 0.0, 20.0),
+    },
+    '>600k': {
+        'overpriced':        (0.0, 66.7, 0.0),
+        'fair':              (12.5, 37.5, 25.0),
+        'underpriced':       (12.5, 37.5, 25.0),
+        'badly_underpriced': (12.5, 37.5, 25.0),
+    },
+}
 
-# 4-tier escalation when Walter keeps failing.
-# Tier 1: per-call retry (close+restart browser, 60s sleep, retry once)
-_WALTER_TIER1_RETRY_SLEEP = 60
-
-# Tier 2: 3 consecutive fails → DEEP RECOVERY
-#   kill Walter chrome, wipe profile, rotate profile dir, fresh fingerprint,
-#   sleep 5 min, fresh login.
-_WALTER_TIER2_FAILS = 3
-_WALTER_TIER2_SLEEP = 300         # 5 minutes
-
-# Tier 3: 6 consecutive fails → LONG RECOVERY (deep + 30 min cooldown)
-_WALTER_TIER3_FAILS = 6
-_WALTER_TIER3_SLEEP = 1800        # 30 minutes
-
-# Tier 4: 10 consecutive fails → FLAG WALTER DEAD for the rest of session.
-#   Every subsequent property goes straight to fallback formula — no more
-#   wasted timeouts. The flag is reset only when a new ValuationEngine is
-#   created (next session).
-_WALTER_TIER4_FAILS = 10
+# Confidence-decision thresholds (apply on RISK_TABLE values)
+SKIP_IF_LOSS_PROB_GE  = 30.0   # P(margin <5%) >= 30% → SKIP
+HIGH_IF_GOOD_PROB_GE  = 50.0   # P(margin >=20%) >= 50% → HIGH
+MED_IF_GOOD_PROB_GE   = 25.0
 
 
 # ─────────────────────────────────────────────────────────────────
-# Helpers
+# Helpers — input parsing + segment classification
 # ─────────────────────────────────────────────────────────────────
 
 def _parse_int(v) -> Optional[int]:
-    """Parse an int from messy values: '€450.000', '450000', '€ 1.250.000', etc."""
     if v is None or v == '':
         return None
     if isinstance(v, (int, float)):
@@ -141,55 +155,27 @@ def _parse_int(v) -> Optional[int]:
     return int(digits) if digits else None
 
 
-def _postcode_prefix(prop: Dict) -> str:
-    """Extract first 2 digits of NL postcode from property dict."""
-    pc = (prop.get('postcode') or '').strip().upper()
-    if pc:
-        m = re.match(r'^(\d{4})', pc)
-        if m:
-            return m.group(1)[:2]
-    addr = prop.get('address') or ''
-    m = re.search(r'\b(\d{4})\s*[A-Z]{2}\b', addr.upper())
-    return m.group(1)[:2] if m else 'default'
+def _ask_band(asking: int) -> str:
+    if asking < 200_000: return '<200k'
+    if asking < 300_000: return '200-300k'
+    if asking < 400_000: return '300-400k'
+    if asking < 600_000: return '400-600k'
+    return '>600k'
 
 
-def _dom_discount(days_on_market: Optional[int]) -> float:
-    if days_on_market is None or days_on_market < 0:
-        return 0.0
-    for upper, disc in _DOM_TIERS:
-        if days_on_market <= upper:
-            return disc
-    return 0.0
+def _spread_band(spread_pct: float) -> str:
+    if spread_pct < -5:  return 'overpriced'
+    if spread_pct <  2:  return 'fair'
+    if spread_pct < 10:  return 'underpriced'
+    return 'badly_underpriced'
 
 
-def _region_discount(prefix: str) -> float:
-    if prefix in _HOT_REGIONS:
-        return 0.0
-    if prefix in _WARM_REGIONS:
-        return 0.0050
-    return 0.0100
-
-
-def _spread_discount(walter: Optional[int], asking: Optional[int]) -> tuple:
-    """Return (discount, spread_fraction). Spread = (walter-asking)/asking.
-    When walter is None (fallback path), returns (0.0, 0.0)."""
-    if not walter or not asking or walter <= asking:
-        return 0.0, 0.0
-    spread = (walter - asking) / asking
-    for upper, disc in _SPREAD_TIERS:
-        if spread <= upper:
-            return disc, spread
-    return 0.0, spread
-
-
-def _compute_x(walter: Optional[int], asking: Optional[int],
-               dom: Optional[int], prefix: str) -> tuple:
-    """Compute total discount X and the three component values."""
-    dd = _dom_discount(dom)
-    rd = _region_discount(prefix)
-    sd, spread = _spread_discount(walter, asking)
-    x = max(0.0, min(MAX_DISCOUNT, dd + rd + sd))
-    return x, dd, rd, sd, spread
+def _dom_pointer(dom: Optional[int]) -> str:
+    """Pick which percentile to use based on days on market."""
+    if dom is None:        return 'balanced'   # P50 default
+    if dom <= 14:          return 'aggressive' # P75
+    if dom > 60:           return 'conservative' # P25
+    return 'balanced'
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -198,21 +184,21 @@ def _compute_x(walter: Optional[int], asking: Optional[int],
 
 @dataclass
 class ValuationResult:
-    walter_price: Optional[int] = None
     woz_value: Optional[int] = None
     suggested_bid: Optional[int] = None
-    confidence: str = 'NONE'           # HIGH | MEDIUM | LOW | FALLBACK | NONE
-    reasoning: str = ''                # log-only, NOT written to sheet
-    walter_reason: str = REASON_ERROR  # REASON_OK | REASON_NO_DATA | ...
+    confidence: str = 'NONE'           # HIGH | MEDIUM | LOW | SKIP | NONE
+    reasoning: str = ''                # log-only
     components: Dict = field(default_factory=dict)
 
     def as_sheet_dict(self) -> Dict:
-        """Flatten for sheets_writer back-write (4 cells: G:J)."""
+        """Flatten for sheets_writer back-write.
+        Returns the 3 cells we write — `bidding_price` (col I) is left empty
+        for the user to fill in.
+        """
         return {
-            'walter_play_it_safe': self.walter_price or '',
-            'woz_value':           self.woz_value    or '',
-            'suggested_bid':       self.suggested_bid or '',
-            'bid_confidence':      self.confidence,
+            'woz_value':       self.woz_value or '',
+            'suggested_bid':   self.suggested_bid or '',
+            'bid_confidence':  self.confidence,
         }
 
 
@@ -221,54 +207,17 @@ class ValuationResult:
 # ─────────────────────────────────────────────────────────────────
 
 class ValuationEngine:
-    """Stateful engine — holds one WalterClient across many properties.
-    Handles Walter retries and falls back to asking-based formula when
-    Walter genuinely has no price (no_data) or remains blocked after retry.
+    """Stateless, fast valuation. No external service calls except WOZ.
+    Each property's valuation finishes in <100ms (just lookups + math).
+    Walter Living dependency removed entirely.
     """
 
-    def __init__(self, walter: Optional[WalterClient] = None):
-        self._walter = walter
-        self._owns_walter = walter is None
-        # Throttle bookkeeping
-        self._last_walter_call_ts: float = 0.0       # when last query started
-        self._consecutive_walter_fails: int = 0      # since last success OR last tier
-        # Monotonic tier level: 0 = no recovery yet, 1 = tier-2 fired,
-        # 2 = tier-3 fired, 3 = DEAD (tier-4). Only ascends, never resets
-        # except on a real Walter success.
-        self._walter_tier_level: int = 0
-        self._walter_dead: bool = False              # Tier-4: skip Walter entirely
-
-    def _get_walter(self) -> WalterClient:
-        if self._walter is None:
-            self._walter = WalterClient(
-                email=config.WALTER_EMAIL,
-                password=config.WALTER_PASSWORD,
-                profile_path=config.WALTER_PROFILE_PATH,
-                headless=config.WALTER_HEADLESS,
-                port=config.WALTER_PORT,
-                response_timeout=config.WALTER_RESPONSE_TIMEOUT,
-            )
-        return self._walter
-
-    def _restart_walter(self) -> None:
-        """Close the Walter session and let next call re-init it. Called on
-        captcha/login failure to start a clean session."""
-        if self._walter is None:
-            return
-        try:
-            self._walter.restart_browser()
-        except Exception:
-            pass
-        # Force re-init on next access
-        if self._owns_walter:
-            self._walter = None
-        # If we don't own Walter, the caller is responsible for the restart;
-        # we still rely on its lazy-init behaviour to reopen.
+    def __init__(self, walter=None):
+        # `walter` accepted for backward-compat with controller signature; ignored.
+        pass
 
     def close(self) -> None:
-        if self._owns_walter and self._walter is not None:
-            self._walter.close()
-            self._walter = None
+        pass
 
     def __enter__(self):
         return self
@@ -276,141 +225,23 @@ class ValuationEngine:
     def __exit__(self, *exc):
         self.close()
 
-    # ── Walter call with retry ─────────────────────────────────
-
-    def _query_walter_with_retry(self, address: str) -> Dict:
-        """Query Walter with 4-tier escalation + jittered politeness.
-
-        Tiers (each fires when consecutive_walter_fails crosses the threshold,
-        BEFORE the next per-call retry to avoid burning quick retries that
-        will also fail):
-
-          - Tier 1 (always)  : per-call restart + 60s sleep + retry once
-          - Tier 2 (3 fails) : DEEP recovery — kill chrome, wipe profile,
-                                rotate profile path, fresh fingerprint, sleep
-                                5 min, fresh login.
-          - Tier 3 (6 fails) : repeat deep recovery + sleep 30 min.
-          - Tier 4 (10 fails): flag Walter DEAD for rest of session — every
-                                subsequent property gets fallback formula
-                                immediately, no Walter call at all.
-
-        Returns the WalterClient dict either from the successful call or the
-        last attempt's failure dict.
-        """
-        import random as _r
-
-        # Tier 4 hard skip — Walter is permanently broken for this session
-        if self._walter_dead:
-            return {
-                'price': None,
-                'reason': REASON_ERROR,
-                'message': 'Walter flagged dead for this session (tier 4)',
-                'raw_text': '',
-                'currency': 'EUR',
-            }
-
-        # ── Politeness delay (jittered) ──────────────────────────
-        now = time.time()
-        elapsed = now - self._last_walter_call_ts
-        target_delay = _r.uniform(_WALTER_DELAY_MIN_SEC, _WALTER_DELAY_MAX_SEC)
-        if self._last_walter_call_ts and elapsed < target_delay:
-            wait = target_delay - elapsed
-            logger.debug(f"  Walter politeness wait: {wait:.1f}s")
-            time.sleep(wait)
-        # Tiny pre-send randomness on top
-        time.sleep(_r.uniform(_WALTER_PRESEND_MIN_SEC, _WALTER_PRESEND_MAX_SEC))
-        self._last_walter_call_ts = time.time()
-
-        first = self._get_walter().get_play_it_safe_bid(address)
-        if first.get('reason') == REASON_OK:
-            # Real success → reset both counters, drop tier level back to 0
-            self._consecutive_walter_fails = 0
-            self._walter_tier_level = 0
-            return first
-
-        # ── Tier escalation BEFORE per-call retry ───────────────
-        # Monotonic: tier_level only ascends. Each tier fires when
-        # consec_fails reaches the threshold for the NEXT tier from current level.
-        #
-        #   level 0 (no recovery yet)  →  3 fails  →  tier-2 (5 min)
-        #   level 1 (tier-2 done)      →  3 fails  →  tier-3 (30 min)
-        #   level 2 (tier-3 done)      →  1 fail   →  tier-4 DEAD
-        if self._walter_tier_level == 2 and self._consecutive_walter_fails >= 1:
-            logger.error(
-                f"Walter Tier-4 reached: tier-3 deep recovery + 30min cooldown "
-                f"didn't restore Walter (still failing). Flagging Walter DEAD "
-                f"for rest of session — all remaining properties will use "
-                f"fallback formula."
-            )
-            self._walter_dead = True
-            self._walter_tier_level = 3
-            return first   # caller writes fallback bid
-
-        if self._walter_tier_level == 1 and self._consecutive_walter_fails >= _WALTER_TIER2_FAILS:
-            logger.warning(
-                f"Walter Tier-3: tier-2 didn't recover Walter ({self._consecutive_walter_fails} "
-                f"more failures since tier-2 cooldown). Escalating: DEEP RECOVERY "
-                f"+ sleeping {_WALTER_TIER3_SLEEP}s ({_WALTER_TIER3_SLEEP//60} min)"
-            )
-            self._get_walter().deep_recovery_restart()
-            time.sleep(_WALTER_TIER3_SLEEP)
-            self._consecutive_walter_fails = 0
-            self._walter_tier_level = 2
-        elif self._walter_tier_level == 0 and self._consecutive_walter_fails >= _WALTER_TIER2_FAILS:
-            logger.warning(
-                f"Walter Tier-2 ({self._consecutive_walter_fails} consecutive "
-                f"failures) — DEEP RECOVERY + sleeping {_WALTER_TIER2_SLEEP}s "
-                f"({_WALTER_TIER2_SLEEP//60} min)"
-            )
-            self._get_walter().deep_recovery_restart()
-            time.sleep(_WALTER_TIER2_SLEEP)
-            self._consecutive_walter_fails = 0
-            self._walter_tier_level = 1
-
-        # ── Tier 1 per-call retry ──────────────────────────────
-        if first.get('reason') in _WALTER_RECOVERABLE:
-            logger.warning(
-                f"Walter recoverable failure ({first.get('reason')}: "
-                f"{first.get('message', '')}) — restarting session and retrying"
-            )
-            self._restart_walter()
-            time.sleep(_WALTER_TIER1_RETRY_SLEEP)
-            second = self._get_walter().get_play_it_safe_bid(address)
-            self._last_walter_call_ts = time.time()
-            if second.get('reason') == REASON_OK:
-                self._consecutive_walter_fails = 0
-            else:
-                self._consecutive_walter_fails += 1
-            return second
-
-        # no_data / non-recoverable — only count as failure if NOT no_data
-        if first.get('reason') != REASON_NO_DATA:
-            self._consecutive_walter_fails += 1
-        else:
-            self._consecutive_walter_fails = 0
-        return first
-
     # ── Main API ──────────────────────────────────────────────
 
     def value_property(self, prop: Dict) -> ValuationResult:
-        """Never raises — returns a ValuationResult with confidence=NONE on
-        unrecoverable errors."""
+        """Compute suggested bid using the distribution-based model.
+        Never raises — returns a ValuationResult with confidence='NONE' on
+        unrecoverable input errors.
+        """
         result = ValuationResult()
         address = prop.get('address') or ''
         asking  = _parse_int(prop.get('asking_price'))
         dom     = _parse_int(prop.get('days_on_market'))
 
-        if not address:
-            result.reasoning = 'No address — cannot value'
+        if not address or not asking:
+            result.reasoning = 'Missing address or asking price — cannot value'
             return result
 
-        # ── 1. Query Walter (with retry on recoverable failures) ──
-        walter = self._query_walter_with_retry(address)
-        reason = walter.get('reason', REASON_ERROR)
-        result.walter_reason = reason
-        wp = walter.get('price')
-
-        # ── 2. WOZ lookup (informational only, never blocks the bid) ──
+        # ── 1. WOZ lookup ───────────────────────────────────
         woz_val: Optional[int] = None
         pc = (prop.get('postcode') or '').strip()
         hn = str(prop.get('house_number') or '').strip()
@@ -433,74 +264,86 @@ class ValuationEngine:
             except Exception as e:
                 logger.debug(f"WOZ lookup failed for {pc} {hn}: {e}")
 
-        prefix = _postcode_prefix(prop)
-
-        # ── 3. Decide path: Walter price OK / no_data fallback / hard failure ──
-        if reason == REASON_OK and wp:
-            wp = int(wp)
-            result.walter_price = wp
-            x, dd, rd, sd, spread = _compute_x(wp, asking, dom, prefix)
-            bid = int(round(wp * (1.0 - x)))
-            result.suggested_bid = bid
-            # HIGH whenever Walter ≥ asking, LOW when Walter < asking, MEDIUM if no asking
-            if asking is None:
-                result.confidence = 'MEDIUM'
-            elif wp >= asking:
-                result.confidence = 'HIGH'
-            else:
-                result.confidence = 'LOW'
-            parts = [f"Walter €{wp:,}"]
-            if asking:
-                parts.append(f"asking €{asking:,}")
-            if dom is not None:
-                parts.append(f"DOM={dom}d (+{dd*100:.2f}%)")
-            parts.append(f"region {prefix} (+{rd*100:.2f}%)")
-            if asking:
-                parts.append(f"spread {spread*100:.1f}% (+{sd*100:.2f}%)")
-            parts.append(f"X={x*100:.2f}% → bid €{bid:,}")
-            if woz_val:
-                parts.append(f"WOZ €{woz_val:,}")
-            result.reasoning = ' | '.join(parts)
-            return result
-
-        # Walter unavailable. Two sub-paths:
-        #   (a) reason == no_data            → expected, immediate fallback
-        #   (b) reason still recoverable     → after retry exhausted, still
-        #                                       use fallback so the queue
-        #                                       doesn't stall on Walter outage
-        #   (c) reason in {timeout, error}   → no fallback; mark NONE so the
-        #                                       row stays empty for retry later
-        fallback_eligible = reason in (REASON_NO_DATA,) or reason in _WALTER_RECOVERABLE
-
-        if not fallback_eligible:
-            result.confidence = 'NONE'
-            result.reasoning = (
-                f"Walter unavailable (reason={reason}, "
-                f"msg={walter.get('message','')}) — no bid"
-            )
-            logger.warning(f"  Valuation: {address} — {result.reasoning}")
-            return result
-
-        # Asking-based fallback. Need asking to compute anything.
-        if not asking:
-            result.confidence = 'NONE'
-            result.reasoning = (
-                f"Walter no_data and no asking price — cannot compute fallback bid"
-            )
-            return result
-
-        # Fallback X: same DOM + region terms; spread part is 0 (no Walter).
-        x, dd, rd, sd, spread = _compute_x(None, asking, dom, prefix)
-        bid = int(round(asking * (1.0 - x)))
-        result.suggested_bid = bid
-        result.confidence = 'FALLBACK'
-        parts = [f"FALLBACK (Walter reason={reason})", f"asking €{asking:,}"]
-        if dom is not None:
-            parts.append(f"DOM={dom}d (+{dd*100:.2f}%)")
-        parts.append(f"region {prefix} (+{rd*100:.2f}%)")
-        parts.append(f"X={x*100:.2f}% → bid €{bid:,}")
+        # ── 2. Estimate market value ─────────────────────────
         if woz_val:
-            parts.append(f"WOZ €{woz_val:,}")
+            mv_estimate = int(woz_val * WOZ_TO_MV_UPLIFT)
+            mv_source = 'WOZ'
+        else:
+            mv_estimate = int(asking * ASK_TO_MV_DEFAULT)
+            mv_source = 'asking'
+
+        # ── 3. Classify segment ──────────────────────────────
+        ab = _ask_band(asking)
+        spread_pct = (mv_estimate - asking) / asking * 100
+        sb = _spread_band(spread_pct)
+
+        # ── 4. Lookup discount distribution ──────────────────
+        p25, p50, p75 = DISCOUNT_TABLE[ab][sb]
+        pointer = _dom_pointer(dom)
+        if   pointer == 'aggressive':   discount = p75
+        elif pointer == 'conservative': discount = p25
+        else:                           discount = p50
+
+        # ── 5. Compute bid ───────────────────────────────────
+        bid = int(round(asking * (1 - discount / 100)))
+
+        # ── 6. Hard guardrails ───────────────────────────────
+        bid_before_guards = bid
+        guard_notes = []
+        ceiling = int(mv_estimate * MV_GUARD)
+        floor = int(asking * MIN_RATIO_TO_ASK)
+        if bid > ceiling:
+            bid = ceiling
+            guard_notes.append(f'capped by MV-guard (≤ MV×{MV_GUARD})')
+        if bid < floor:
+            bid = floor
+            guard_notes.append(f'floored at asking×{MIN_RATIO_TO_ASK}')
+
+        # ── 7. Risk-based confidence ─────────────────────────
+        p_loss, p_thin, p_good = RISK_TABLE[ab][sb]
+        if p_loss >= SKIP_IF_LOSS_PROB_GE:
+            confidence = 'SKIP'
+        elif p_good >= HIGH_IF_GOOD_PROB_GE:
+            confidence = 'HIGH'
+        elif p_good >= MED_IF_GOOD_PROB_GE:
+            confidence = 'MEDIUM'
+        else:
+            confidence = 'LOW'
+
+        result.suggested_bid = bid
+        result.confidence = confidence
+
+        result.components = {
+            'asking':         asking,
+            'mv_estimate':    mv_estimate,
+            'mv_source':      mv_source,
+            'ask_band':       ab,
+            'spread_pct':     round(spread_pct, 2),
+            'spread_band':    sb,
+            'dom':            dom,
+            'pointer':        pointer,
+            'discount_p25':   p25,
+            'discount_p50':   p50,
+            'discount_p75':   p75,
+            'discount_used':  discount,
+            'risk_loss':      p_loss,
+            'risk_good':      p_good,
+            'bid_pre_guard':  bid_before_guards,
+            'guard_notes':    guard_notes,
+        }
+
+        parts = [
+            f'asking €{asking:,}',
+            f'MV(est)=€{mv_estimate:,}({mv_source})',
+            f'band={ab}/{sb}',
+            f'DOM={dom}d→{pointer}',
+            f'disc={discount:.2f}%',
+            f'bid €{bid:,}',
+            f'risk_loss={p_loss:.0f}% risk_good={p_good:.0f}%',
+            f'conf={confidence}',
+        ]
+        if guard_notes:
+            parts.append('|'.join(guard_notes))
         result.reasoning = ' | '.join(parts)
-        logger.info(f"  Valuation FALLBACK for {address}: {result.reasoning}")
+        logger.info(f"  Valuation [{address}]: {result.reasoning}")
         return result

@@ -36,7 +36,7 @@ from funda.src.modules.excel_writer import ExcelWriter
 from funda.src.modules.kvk_storage import get_kvk_storage
 from funda.src.modules.sheets_writer import SheetsWriter
 from funda.src.modules.valuation_engine import ValuationEngine
-from funda.src.modules.walter_client import WalterClient
+# WalterClient import removed — valuation is now Walter-free (distribution-based)
 
 logger = logging.getLogger('funda.controller')
 
@@ -874,7 +874,7 @@ class FundaController:
                     result = engine.value_property(item)
                     logger.info(
                         f"  [Walter] {address} → {result.reasoning} "
-                        f"(walter_reason={result.walter_reason}, conf={result.confidence})"
+                        f"(conf={result.confidence})"
                     )
 
                     if not sheets_writer or not url:
