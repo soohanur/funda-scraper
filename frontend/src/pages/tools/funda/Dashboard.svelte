@@ -331,7 +331,12 @@
       </div>
 
       <!-- Stats Grid -->
-      <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 sm:gap-4 mb-4 sm:mb-6">
+      <div class="grid grid-cols-2 sm:grid-cols-5 gap-3 sm:gap-4 mb-4 sm:mb-6">
+        <div class="bg-gray-50 rounded-lg p-3 sm:p-4 text-center">
+          <p class="text-xs text-gray-600 mb-1">Total Available</p>
+          <p class="text-lg sm:text-2xl font-bold text-gray-900">{status.total_search_results > 0 ? status.total_search_results.toLocaleString() : '—'}</p>
+          <p class="text-xs text-gray-500">{status.collection_status === 'collecting' ? 'collecting...' : 'on funda'}</p>
+        </div>
         <div class="bg-indigo-50 rounded-lg p-3 sm:p-4 text-center">
           <p class="text-xs text-indigo-600 mb-1">Collected</p>
           <p class="text-lg sm:text-2xl font-bold text-indigo-600">{status.ids_queued > 0 ? status.ids_queued.toLocaleString() : '—'}</p>
