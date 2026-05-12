@@ -1595,23 +1595,13 @@ def start_scraper(
             raise RuntimeError("Scraper is already running")
 
         if resume_from_page is None and resume_snapshot is None:
-            # Fresh manual start. Discard leftover run-state, AND clear all
-            # storage (KVK + sheet rows) so every run is a clean slate with
-            # zero carry-over duplicates. (Auto-resume path skips this — it's
-            # continuing a crashed run, must keep its state.)
+            # Fresh manual start. Discard leftover run-state only — do NOT
+            # touch KVK storage or the sheet. They persist across runs and are
+            # only cleared manually (frontend "Clear KVK Storage" button, or
+            # editing the sheet by hand). Re-running the same date window will
+            # therefore skip already-scraped properties (shown as "Duplicate"),
+            # which is the intended dedup behaviour.
             _clear_run_state()
-            try:
-                cleared = get_kvk_storage().count()
-                get_kvk_storage().clear()
-                logger.info(f"  Fresh start: cleared {cleared} KVK ids from permanent storage")
-            except Exception as e:
-                logger.warning(f"  Could not clear KVK storage: {e}")
-            try:
-                sw = SheetsWriter()
-                sw.clear_all_data_rows()
-                logger.info("  Fresh start: wiped all data rows from the sheet")
-            except Exception as e:
-                logger.warning(f"  Could not wipe sheet rows: {e}")
 
         _controller = FundaController(
             publication_date=publication_date,
