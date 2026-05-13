@@ -14,9 +14,12 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     if (!loading && !token) router.replace("/login");
   }, [loading, token, router]);
 
-  // Persist collapse state.
+  // Persist collapse state. We hydrate from localStorage once on mount —
+  // setState-in-effect is the documented React 19 pattern for client-only
+  // storage like this, since SSR has no localStorage.
   useEffect(() => {
     const v = window.localStorage.getItem("sidebar_collapsed");
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     if (v === "1") setCollapsed(true);
   }, []);
   useEffect(() => {

@@ -20,7 +20,7 @@ type AuthState = {
   hydrate: () => Promise<void>;
 };
 
-export const useAuth = create<AuthState>((set, get) => ({
+export const useAuth = create<AuthState>((set) => ({
   token: null,
   user: null,
   loading: true,
