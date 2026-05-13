@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { ChevronLeft, ChevronRight, Loader2, RefreshCw } from "lucide-react";
+import { Loader2, RefreshCw } from "lucide-react";
 import { toast } from "sonner";
 import {
   propertiesApi,
@@ -14,10 +14,12 @@ import { EmailModal } from "@/components/email-modal";
 import { PropertiesTable } from "@/components/properties-table";
 import { formatNumber } from "@/lib/utils";
 
-const PAGE_SIZE = 50;
+// No pagination — single scrollable list. Backend cap is 1000.
+const LIST_LIMIT = 1000;
 
-// Sheet tab order (newest publication-date bucket first).
-const TAB_ORDER = [
+// Sheet tab dropdown is fixed — always all five buckets, regardless of
+// whether the DB has rows for each one yet.
+const TAB_OPTIONS = [
   "3-7 Days Ago",
   "8-12 Days Ago",
   "13-17 Days Ago",
@@ -36,7 +38,7 @@ export default function DataPage() {
   const [params, setParams] = useState<ListParams>({
     sort: "scrape_date",
     order: "asc",
-    limit: PAGE_SIZE,
+    limit: LIST_LIMIT,
     offset: 0,
   });
   const [searchInput, setSearchInput] = useState("");
@@ -52,12 +54,6 @@ export default function DataPage() {
     }, 300);
     return () => clearTimeout(t);
   }, [searchInput]);
-
-  const { data: filterOpts } = useQuery({
-    queryKey: ["properties", "filters"],
-    queryFn: propertiesApi.filters,
-    staleTime: 60_000,
-  });
 
   const { data, isLoading, isFetching } = useQuery({
     queryKey: ["properties", "list", params],
@@ -77,9 +73,6 @@ export default function DataPage() {
     onError: () => toast.error("Sync failed — check backend logs"),
   });
 
-  const totalPages = Math.max(1, Math.ceil((data?.total ?? 0) / (params.limit ?? PAGE_SIZE)));
-  const currentPage = Math.floor((params.offset ?? 0) / (params.limit ?? PAGE_SIZE)) + 1;
-
   const onSort = (key: string) => {
     setParams((p) => {
       if (p.sort === key) {
@@ -90,15 +83,6 @@ export default function DataPage() {
   };
 
   const items = data?.items ?? [];
-  const showingFrom = items.length > 0 ? (params.offset ?? 0) + 1 : 0;
-  const showingTo = (params.offset ?? 0) + items.length;
-
-  // Order sheet_tab dropdown — known tabs in fixed order, then anything else.
-  const allTabs = filterOpts?.sheet_tab ?? [];
-  const orderedTabs = [
-    ...TAB_ORDER.filter((t) => allTabs.includes(t)),
-    ...allTabs.filter((t) => !TAB_ORDER.includes(t)),
-  ];
 
   return (
     <PageContainer>
@@ -121,7 +105,7 @@ export default function DataPage() {
           }
         >
           <option value="">All time</option>
-          {orderedTabs.map((t) => (
+          {TAB_OPTIONS.map((t) => (
             <option key={t} value={t}>
               {t}
             </option>
@@ -158,7 +142,7 @@ export default function DataPage() {
         <span>
           {isLoading
             ? "Loading…"
-            : `Showing ${formatNumber(showingFrom)}–${formatNumber(showingTo)} of ${formatNumber(data?.total ?? 0)}`}
+            : `${formatNumber(items.length)} of ${formatNumber(data?.total ?? 0)} properties`}
           {isFetching && !isLoading ? " · refreshing…" : ""}
         </span>
       </div>
@@ -177,42 +161,6 @@ export default function DataPage() {
         onSort={onSort}
         onEmail={(p) => setEmailProperty(p as Property)}
       />
-
-      <div className="card mt-3 flex items-center justify-between px-4 py-3 text-sm">
-        <span className="text-[var(--muted-foreground)]">
-          Page {currentPage} of {totalPages}
-        </span>
-        <div className="flex gap-2">
-          <button
-            type="button"
-            className="btn-outline"
-            disabled={(params.offset ?? 0) <= 0 || isFetching}
-            onClick={() =>
-              setParams((p) => ({
-                ...p,
-                offset: Math.max(0, (p.offset ?? 0) - (p.limit ?? PAGE_SIZE)),
-              }))
-            }
-          >
-            <ChevronLeft className="h-4 w-4" />
-            Prev
-          </button>
-          <button
-            type="button"
-            className="btn-outline"
-            disabled={currentPage >= totalPages || isFetching}
-            onClick={() =>
-              setParams((p) => ({
-                ...p,
-                offset: (p.offset ?? 0) + (p.limit ?? PAGE_SIZE),
-              }))
-            }
-          >
-            Next
-            <ChevronRight className="h-4 w-4" />
-          </button>
-        </div>
-      </div>
 
       <EmailModal property={emailProperty} open={!!emailProperty} onClose={() => setEmailProperty(null)} />
     </PageContainer>
