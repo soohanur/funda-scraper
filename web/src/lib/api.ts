@@ -8,7 +8,10 @@ const BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000/api/v1";
 
 export const api = axios.create({
   baseURL: BASE,
-  timeout: 30000,
+  // Property list with all rows + full schema can take 30-60s on first
+  // hit when DB is cold. 120s gives the worst-case load room to finish
+  // without aborting the table fetch.
+  timeout: 120000,
 });
 
 api.interceptors.request.use((cfg) => {

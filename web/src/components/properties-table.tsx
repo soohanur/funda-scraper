@@ -449,15 +449,33 @@ function ImagesCell({
   onOpen: (images: string[]) => void;
 }) {
   const images = parseImages(property.images);
+  const [loading, setLoading] = useState(false);
   if (images.length === 0) {
     return <span className="text-[var(--muted-foreground)]">—</span>;
   }
+  const handleClick = async () => {
+    // List endpoint returns only the first image URL (compact mode).
+    // Fetch the full property record so the lightbox shows every photo.
+    if (loading) return;
+    setLoading(true);
+    try {
+      const full = await propertiesApi.get(property.id);
+      const all = parseImages(full.images);
+      onOpen(all.length > 0 ? all : images);
+    } catch {
+      // Fall back to whatever we already have.
+      onOpen(images);
+    } finally {
+      setLoading(false);
+    }
+  };
   return (
     <button
       type="button"
-      onClick={() => onOpen(images)}
+      onClick={handleClick}
+      disabled={loading}
       className="group relative flex items-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2 py-1 hover:border-[var(--color-brand-400)]"
-      title={`${images.length} image${images.length === 1 ? "" : "s"}`}
+      title="View photos"
     >
       <span className="relative h-8 w-12 shrink-0 overflow-hidden rounded-md bg-[var(--muted)]">
         {/* eslint-disable-next-line @next/next/no-img-element */}
@@ -469,8 +487,11 @@ function ImagesCell({
         />
       </span>
       <span className="flex items-center gap-1 text-xs">
-        <ImageIcon className="h-3.5 w-3.5" />
-        {images.length}
+        {loading ? (
+          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+        ) : (
+          <ImageIcon className="h-3.5 w-3.5" />
+        )}
       </span>
     </button>
   );

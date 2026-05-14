@@ -158,6 +158,12 @@ async def list_properties(
     # (~55k), still bounded so a typo can't ask for the whole world.
     limit: int = Query(100, ge=1, le=100000),
     offset: int = Query(0, ge=0),
+    # When true (default for the table view) drops the heaviest fields
+    # — description (~2KB/row) and notes — and trims images to first
+    # URL only. Cuts the response from ~10KB/row to ~1.5KB/row, so 3000
+    # properties go 30MB → 4-5MB and the API responds in <5s instead of
+    # ~50s. Profile detail endpoint always returns the full record.
+    compact: bool = Query(True),
 ):
     """List properties (DB-backed). Use POST /properties/sync to refresh from Sheet."""
     if sort not in _SORT_FIELDS:
@@ -186,7 +192,21 @@ async def list_properties(
     res = await db.execute(base)
     items = res.scalars().all()
 
-    return PropertyList(items=items, total=int(total), limit=limit, offset=offset)
+    # Build response models — copy out of ORM so we never mutate session
+    # state. In compact mode we then blank the heaviest fields on the
+    # Pydantic copies before serialization.
+    out_items = [PropertyOut.model_validate(p) for p in items]
+    if compact:
+        for p in out_items:
+            p.description = None
+            p.notes = None
+            if p.images:
+                # Keep only the first thumbnail URL — full carousel is
+                # fetched on demand from /properties/{id}.
+                first = p.images.split(',')[0].strip()
+                p.images = first or None
+
+    return PropertyList(items=out_items, total=int(total), limit=limit, offset=offset)
 
 
 @router.get("/filters")
