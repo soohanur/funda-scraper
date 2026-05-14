@@ -86,6 +86,10 @@ class SheetsWriter:
         self.spreadsheet_id   = spreadsheet_id   or config.GOOGLE_SHEETS_SPREADSHEET_ID
         self._client: Optional[gspread.Client]       = None
         self._spreadsheet: Optional[gspread.Spreadsheet] = None
+        # Guards _connect against concurrent reconnect attempts (writer thread,
+        # valuation thread, bidding-mirror BackgroundTask, dashboard sync).
+        import threading
+        self._connect_lock = threading.Lock()
         self._formatted_sheets: Set[str] = set()   # track formatted tabs this session
         # In-memory URL set per tab, seeded from the sheet on first use and
         # updated after every append. Prevents writing a property twice — both
@@ -97,20 +101,50 @@ class SheetsWriter:
     # ── Connection ────────────────────────────────────────────
 
     def _connect(self) -> None:
-        if self._client is not None:
+        # Both must be live — earlier code only checked _client, which broke
+        # if a prior open_by_key failure left _spreadsheet=None or a thread
+        # raced past the guard before the spreadsheet handle was assigned.
+        if self._client is not None and self._spreadsheet is not None:
             return
-        creds = Credentials.from_service_account_file(
-            self.credentials_path, scopes=SCOPES,
-        )
-        self._client       = gspread.authorize(creds)
-        self._spreadsheet  = self._client.open_by_key(self.spreadsheet_id)
-        logger.info(f"Connected to Google Sheets: {self._spreadsheet.title}")
+        with self._connect_lock:
+            if self._client is not None and self._spreadsheet is not None:
+                return
+            try:
+                creds = Credentials.from_service_account_file(
+                    self.credentials_path, scopes=SCOPES,
+                )
+                client = gspread.authorize(creds)
+                spreadsheet = client.open_by_key(self.spreadsheet_id)
+            except Exception:
+                # Reset both so the next call retries cleanly instead of
+                # entering the half-connected state that caused
+                # 'NoneType has no attribute worksheet'.
+                self._client = None
+                self._spreadsheet = None
+                raise
+            self._client = client
+            self._spreadsheet = spreadsheet
+            logger.info(f"Connected to Google Sheets: {self._spreadsheet.title}")
+
+    def _force_reconnect(self) -> None:
+        """Drop cached client + spreadsheet so the next op rebuilds them."""
+        with self._connect_lock:
+            self._client = None
+            self._spreadsheet = None
+            self._formatted_sheets.clear()
+            self._tab_urls.clear()
 
     # ── Worksheet setup ───────────────────────────────────────
 
     def _get_or_create_worksheet(self, tab_name: str) -> gspread.Worksheet:
         """Get existing worksheet or create it, then ensure headers + formatting."""
         self._connect()
+        # Belt-and-braces: if a prior op left _spreadsheet None despite _client
+        # being set, force a clean reconnect now instead of crashing with
+        # 'NoneType has no attribute worksheet'.
+        if self._spreadsheet is None:
+            self._force_reconnect()
+            self._connect()
 
         try:
             ws = self._spreadsheet.worksheet(tab_name)
@@ -312,7 +346,30 @@ class SheetsWriter:
         append and return True. Returning True is intentional — it makes the
         controller treat the property as 'written' so it gets added to KVK
         storage, closing the loop that previously could leave a stale dup.
+
+        Retry policy: transient gspread errors (token expiry, network blip,
+        AttributeError from a half-connected client) trigger one
+        force_reconnect + retry. Persistent failures return False.
         """
+        last_exc: Optional[Exception] = None
+        for attempt in (1, 2):
+            try:
+                return self._write_property_once(prop, publication_date)
+            except Exception as e:
+                last_exc = e
+                if attempt == 1:
+                    logger.warning(
+                        f"  Sheets write transient error (attempt 1) — "
+                        f"forcing reconnect: {e}"
+                    )
+                    self._force_reconnect()
+                    continue
+                logger.error(f"  ✗ Sheets write failed after retry: {e}")
+                return False
+        # unreachable
+        return False
+
+    def _write_property_once(self, prop: dict, publication_date: int) -> bool:
         tab_name = self._get_tab_name(publication_date)
         try:
             ws = self._get_or_create_worksheet(tab_name)
@@ -370,9 +427,9 @@ class SheetsWriter:
             )
             return True
 
-        except Exception as e:
-            logger.error(f"  ✗ Sheets write failed: {e}")
-            return False
+        except Exception:
+            # Bubble up so the outer write_property can decide to reconnect+retry.
+            raise
 
     def write_properties(self, properties: list, publication_date: int) -> int:
         written = 0
