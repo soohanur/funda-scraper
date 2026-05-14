@@ -87,7 +87,7 @@ const COLUMNS: Array<{
   sortable?: boolean;
   width?: string;
 }> = [
-  { key: "scrape_date", label: "Scrape Date", sortable: true, width: "110px" },
+  { key: "scrape_date", label: "Scrape Date", sortable: true, width: "130px" },
   { key: "address", label: "Address", sortable: true, width: "240px" },
   { key: "listed_since", label: "Listed Since", sortable: true, width: "110px" },
   { key: "days_on_market", label: "DOM", sortable: true, width: "70px" },
@@ -151,6 +151,8 @@ export function PropertiesTable({
 
   // Lightbox state — clicking the Images cell opens this for the row.
   const [lightbox, setLightbox] = useState<{ images: string[]; address: string } | null>(null);
+  // Cell-overflow modal — clicking a truncated cell shows the full value.
+  const [cellModal, setCellModal] = useState<{ label: string; value: string } | null>(null);
 
   return (
     <div className={cn("card flex min-h-0 flex-col overflow-hidden", className)}>
@@ -206,12 +208,12 @@ export function PropertiesTable({
               <tr
                 key={p.id}
                 className={cn(
-                  "border-b border-[var(--border)] hover:bg-[var(--muted)]",
+                  "h-12 border-b border-[var(--border)] hover:bg-[var(--muted)]",
                   idx % 2 === 1 && "bg-[var(--surface-2)]",
                 )}
               >
                 {COLUMNS.map((c) => (
-                  <td key={c.key as string} className="px-3 py-2.5 align-top">
+                  <td key={c.key as string} className="h-12 max-h-12 overflow-hidden px-3 align-middle whitespace-nowrap">
                     {c.key === "bidding_price" && showBiddingEdit ? (
                       <BiddingCell property={p} />
                     ) : c.key === "images" ? (
@@ -222,23 +224,24 @@ export function PropertiesTable({
                         }
                       />
                     ) : (
-                      renderCell(p, c.key)
+                      <ClickableCell
+                        label={c.label}
+                        value={renderCell(p, c.key)}
+                        rawValue={(p[c.key] ?? "") as string}
+                        onOverflow={(label, value) => setCellModal({ label, value })}
+                      />
                     )}
                   </td>
                 ))}
-                <td className="sticky right-0 bg-[var(--surface)] px-3 py-2.5 text-right align-top">
+                <td className="sticky right-0 h-12 bg-[var(--surface)] px-3 text-right align-middle">
                   <div className="flex justify-end gap-1">
-                    {p.url && (
-                      <a
-                        href={p.url}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="rounded-lg p-1.5 text-[var(--color-brand-700)] hover:bg-[var(--color-brand-50)]"
-                        title="Open on funda.nl"
-                      >
-                        <FundaIcon className="h-4 w-4" />
-                      </a>
-                    )}
+                    <Link
+                      href={`/data/${p.id}`}
+                      className="rounded-lg p-1.5 text-[var(--color-brand-700)] hover:bg-[var(--color-brand-50)]"
+                      title="View property profile"
+                    >
+                      <FundaIcon className="h-4 w-4" />
+                    </Link>
                     {onEmail && (
                       <button
                         type="button"
@@ -249,13 +252,17 @@ export function PropertiesTable({
                         <Mail className="h-4 w-4" />
                       </button>
                     )}
-                    <Link
-                      href={`/data/${p.id}`}
-                      className="rounded-lg p-1.5 text-[var(--muted-foreground)] hover:bg-[var(--muted)]"
-                      title="View profile"
-                    >
-                      <ExternalLink className="h-4 w-4" />
-                    </Link>
+                    {p.url && (
+                      <a
+                        href={p.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="rounded-lg p-1.5 text-[var(--muted-foreground)] hover:bg-[var(--muted)]"
+                        title="Open on funda.nl"
+                      >
+                        <ExternalLink className="h-4 w-4" />
+                      </a>
+                    )}
                   </div>
                 </td>
               </tr>
@@ -271,6 +278,92 @@ export function PropertiesTable({
           onClose={() => setLightbox(null)}
         />
       )}
+
+      {cellModal && (
+        <CellModal
+          label={cellModal.label}
+          value={cellModal.value}
+          onClose={() => setCellModal(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+// Wrapper that detects when cell content overflows the fixed row height /
+// width and, on click, hands the raw text to the parent modal so the user
+// can read the full value without breaking the row's grid alignment.
+function ClickableCell({
+  label,
+  value,
+  rawValue,
+  onOverflow,
+}: {
+  label: string;
+  value: React.ReactNode;
+  rawValue: string;
+  onOverflow: (label: string, value: string) => void;
+}) {
+  const text = (rawValue ?? "").toString();
+  const handler = () => {
+    if (text.trim().length === 0) return;
+    onOverflow(label, text);
+  };
+  return (
+    <button
+      type="button"
+      onClick={handler}
+      className="flex w-full max-w-full items-center overflow-hidden text-left"
+      title={text || undefined}
+    >
+      <span className="block w-full truncate">{value}</span>
+    </button>
+  );
+}
+
+function CellModal({
+  label,
+  value,
+  onClose,
+}: {
+  label: string;
+  value: string;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 grid place-items-center bg-black/60 p-4"
+      onClick={onClose}
+    >
+      <div
+        className="card relative w-full max-w-2xl overflow-hidden p-0"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between border-b border-[var(--border)] px-5 py-3">
+          <div className="text-xs font-semibold uppercase tracking-wider text-[var(--muted-foreground)]">
+            {label}
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            className="grid h-8 w-8 place-items-center rounded-full text-[var(--muted-foreground)] hover:bg-[var(--muted)]"
+            aria-label="Close"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+        <div className="max-h-[70vh] overflow-auto whitespace-pre-wrap break-words p-5 text-sm leading-relaxed">
+          {value}
+        </div>
+      </div>
     </div>
   );
 }
