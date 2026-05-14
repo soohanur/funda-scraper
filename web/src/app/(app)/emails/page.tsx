@@ -191,10 +191,6 @@ export default function EmailsPage() {
         </div>
       </div>
 
-      <p className="mt-4 text-center text-xs text-[var(--muted-foreground)]">
-        Google Workspace send integration is wired stub → real send arrives in a follow-up.
-        Every email is recorded in both DB and the &lsquo;Emails&rsquo; tab of the project Google Sheet.
-      </p>
     </PageContainer>
   );
 }

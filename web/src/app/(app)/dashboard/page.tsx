@@ -76,10 +76,7 @@ export default function DashboardPage() {
       </div>
 
       <div className="mt-6 mb-2 flex shrink-0 items-center justify-between">
-        <div>
-          <h3 className="text-sm font-semibold">Latest scrapes</h3>
-          <p className="text-xs text-[var(--muted-foreground)]">Newest 10 properties (same view as Global Data)</p>
-        </div>
+        <h3 className="text-sm font-semibold">Latest scrapes</h3>
         <Link href="/data" className="btn-ghost text-xs">
           View all
           <ArrowRight className="h-3.5 w-3.5" />
