@@ -237,8 +237,29 @@ class ValuationEngine:
         asking  = _parse_int(prop.get('asking_price'))
         dom     = _parse_int(prop.get('days_on_market'))
 
+        # Asking-price fallback: some Funda listings hide the price
+        # ("Prijs op aanvraag") or show a range. If asking didn't parse,
+        # synthesise it from price_per_m2 × living_area when both are present.
+        asking_source = 'listed'
+        if not asking:
+            ppm2 = _parse_int(prop.get('price_per_m2'))
+            la   = _parse_int(prop.get('living_area'))
+            if ppm2 and la and la > 0:
+                asking = ppm2 * la
+                asking_source = 'derived(€/m²×m²)'
+                logger.info(
+                    f"  Asking missing — derived €{asking:,} from "
+                    f"€{ppm2:,}/m² × {la}m² for [{address}]"
+                )
+
         if not address or not asking:
-            result.reasoning = 'Missing address or asking price — cannot value'
+            missing = []
+            if not address: missing.append('address')
+            if not asking:  missing.append('asking_price')
+            result.reasoning = (
+                f"Cannot value [{address or '?'}]: missing {', '.join(missing)}"
+            )
+            logger.warning(f"  ✗ Valuation skipped: {result.reasoning}")
             return result
 
         # ── 1. WOZ lookup ───────────────────────────────────
@@ -315,6 +336,7 @@ class ValuationEngine:
 
         result.components = {
             'asking':         asking,
+            'asking_source':  asking_source,
             'mv_estimate':    mv_estimate,
             'mv_source':      mv_source,
             'ask_band':       ab,

@@ -978,6 +978,9 @@ class FundaController:
                 logger.info(f"  [Writer] ✓ {result.get('address', '?')}")
 
                 # Hand off to Walter worker for valuation back-write.
+                # price_per_m2 + living_area passed as fallback so the engine
+                # can synthesise an asking price when Funda hides it
+                # ("Prijs op aanvraag" / range listings).
                 if valuation_queue is not None:
                     valuation_queue.put({
                         'url':            result.get('url', ''),
@@ -987,6 +990,8 @@ class FundaController:
                         'postcode':       result.get('postcode', ''),
                         'house_number':   result.get('house_number', ''),
                         'house_addition': result.get('house_addition', ''),
+                        'price_per_m2':   result.get('price_per_m2', ''),
+                        'living_area':    result.get('living_area', ''),
                     })
             else:
                 with self._stats_lock:
