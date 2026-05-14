@@ -299,21 +299,52 @@ class FundaController:
         self._captcha_lock = threading.Lock()         # Prevents double-trigger
         self._captcha_reset_event = threading.Event() # Signals "restart complete, resume"
 
-    @property
-    def search_url(self) -> str:
-        """Build search URL with a wide enough publication_date filter, sorted new→old.
+    # Funda capped global pagination at ~12,000 reachable listings (≈ last 8d
+    # for date_down, ≈ 180d back for date_up). To reach 13-17 / 25-30 / 30+ day
+    # buckets, we shrink the search scope with selected_area=<province> so each
+    # query stays under the 12k cap. NL has 12 provinces; their union = full
+    # Funda catalog. For shallow buckets (3-7d, 8-12d) the global URL still
+    # works and is faster, so we keep it.
+    _PROVINCE_AREAS = (
+        "provincie-drenthe",
+        "provincie-flevoland",
+        "provincie-friesland",
+        "provincie-gelderland",
+        "provincie-groningen",
+        "provincie-limburg",
+        "provincie-noord-brabant",
+        "provincie-noord-holland",
+        "provincie-overijssel",
+        "provincie-utrecht",
+        "provincie-zeeland",
+        "provincie-zuid-holland",
+    )
 
-        IMPORTANT: We use sort="date_down" (newest first), not "date_up", because
-        Funda's date_up sort produces duplicate pages past ~page 1340 (every later
-        page returns the same content as the last real page). With date_down we
-        start at page 1 (= today) and walk forward to older listings — pagination
-        always returns fresh content on every page.
-        """
+    def _build_search_url_for_area(self, area: str) -> str:
         base = 'https://www.funda.nl/zoeken/koop'
         funda_pub_date = config.FUNDA_PUB_DATE_PARAM.get(self.publication_date, 30)
         if funda_pub_date == 0:
-            return f'{base}?selected_area=["nl"]&availability=["available"]&sort="date_down"'
-        return f'{base}?selected_area=["nl"]&publication_date={funda_pub_date}&availability=["available"]&sort="date_down"'
+            return f'{base}?selected_area=["{area}"]&availability=["available"]&sort="date_down"'
+        return f'{base}?selected_area=["{area}"]&publication_date={funda_pub_date}&availability=["available"]&sort="date_down"'
+
+    @property
+    def search_urls(self) -> list:
+        """List of search URLs to walk in sequence.
+
+        Shallow buckets (3-7d, 8-12d): single national URL — fast, fully
+        reachable under Funda's 12k pagination cap.
+        Deep buckets (13-17d, 25-30d, 30+d): per-province URLs so each query
+        stays under the cap.
+        """
+        if self.publication_date in (5, 10):
+            return [self._build_search_url_for_area("nl")]
+        return [self._build_search_url_for_area(p) for p in self._PROVINCE_AREAS]
+
+    @property
+    def search_url(self) -> str:
+        """Backward-compat: first URL only. New code should use search_urls."""
+        urls = self.search_urls
+        return urls[0] if urls else self._build_search_url_for_area("nl")
 
     def _update_stats(self, **kwargs):
         """Thread-safe stats update with overall progress calculation."""
@@ -1222,41 +1253,63 @@ class FundaController:
 
                         date_range = config.DATE_RANGES.get(self.publication_date, (7, 3))
 
-                        self.collector = PropertyCollector(
-                            browser=self.browser,
-                            search_url=self.search_url,
-                            target_count=99999,
-                            min_page_delay=config.MIN_DELAY_BETWEEN_PAGES,
-                            max_page_delay=config.MAX_DELAY_BETWEEN_PAGES,
-                            on_progress=_on_collection_progress,
-                            stop_event=self._stop_event,
-                            date_range=date_range,
-                        )
+                        # Iterate one or more search URLs (one per province for
+                        # deep buckets, one national URL for shallow buckets).
+                        # Aggregate state (queued_ids / kvk_storage / work_queue)
+                        # carries across URLs so dedup is preserved.
+                        urls = self.search_urls
+                        total_seen_across_urls = 0
+                        total_results_seen = 0
+                        for url_idx, url in enumerate(urls, start=1):
+                            if self._check_stop():
+                                break
+                            if len(urls) > 1:
+                                logger.info(
+                                    f"  ── Collecting URL {url_idx}/{len(urls)} ──"
+                                )
 
-                        self.collector.collect_kvk_numbers(
-                            output_queue=work_queue,
-                            kvk_storage=self.kvk_storage,
-                            queued_ids=queued_ids,
-                            resume_from_page=resume_page,
-                            prior_storage_snapshot=prior_storage_snapshot,
-                        )
-
-                        # collect_kvk_numbers returned without raising → natural completion
-                        if self.collector.total_search_results > 0:
-                            effective_collected = progress_state['collected_offset'] + len(self.collector.collected)
-                            self._update_stats(
-                                total_search_results=self.collector.total_search_results,
-                                ids_collected=max(self.stats.ids_collected, effective_collected),
-                                ids_queued=max(self.stats.ids_queued, len(queued_ids)),
-                                kvk_collected_this_session=max(self.stats.ids_queued, len(queued_ids)),
-                                duplicate_in_storage=self.stats.duplicate_in_storage,
-                                duplicate_in_retry_queue=self.stats.duplicate_in_retry_queue,
-                                collection_status="done",
+                            self.collector = PropertyCollector(
+                                browser=self.browser,
+                                search_url=url,
+                                target_count=99999,
+                                min_page_delay=config.MIN_DELAY_BETWEEN_PAGES,
+                                max_page_delay=config.MAX_DELAY_BETWEEN_PAGES,
+                                on_progress=_on_collection_progress,
+                                stop_event=self._stop_event,
+                                date_range=date_range,
                             )
+
+                            # resume_from_page only applies to the FIRST URL —
+                            # later URLs always start fresh (their own search).
+                            self.collector.collect_kvk_numbers(
+                                output_queue=work_queue,
+                                kvk_storage=self.kvk_storage,
+                                queued_ids=queued_ids,
+                                resume_from_page=resume_page if url_idx == 1 else None,
+                                prior_storage_snapshot=prior_storage_snapshot,
+                            )
+
+                            total_seen_across_urls += len(self.collector.collected)
+                            total_results_seen += self.collector.total_search_results or 0
+
+                            # Update stats after every URL so the dashboard
+                            # reflects per-province progress.
+                            if self.collector.total_search_results > 0 or len(urls) > 1:
+                                effective_collected = progress_state['collected_offset'] + total_seen_across_urls
+                                self._update_stats(
+                                    total_search_results=max(self.stats.total_search_results, total_results_seen),
+                                    ids_collected=max(self.stats.ids_collected, effective_collected),
+                                    ids_queued=max(self.stats.ids_queued, len(queued_ids)),
+                                    kvk_collected_this_session=max(self.stats.ids_queued, len(queued_ids)),
+                                    duplicate_in_storage=self.stats.duplicate_in_storage,
+                                    duplicate_in_retry_queue=self.stats.duplicate_in_retry_queue,
+                                    collection_status="collecting" if url_idx < len(urls) else "done",
+                                )
 
                         logger.info(
                             f"  Collection finished naturally — {len(queued_ids)} unique IDs "
-                            f"queued, {len(self.collector.collected)} total seen"
+                            f"queued, {total_seen_across_urls} total seen across "
+                            f"{len(urls)} URL(s)"
                         )
                         completed_naturally = True
                         _update_run_state_field('collection_status', 'done')
