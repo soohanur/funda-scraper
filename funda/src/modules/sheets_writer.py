@@ -74,8 +74,153 @@ _ROW_ODD     = {'red': 1.0,   'green': 1.0,   'blue': 1.0}
 _ROW_EVEN    = {'red': 0.929, 'green': 0.941, 'blue': 0.969}
 
 
+class _BatchBuffer:
+    """Per-tab thread-safe row buffer for batched Google Sheets appends.
+
+    Three scraper workers share one SheetsWriter and may all call
+    write_property() at the same time. Each tab gets its own buffer +
+    lock so concurrent writes to different publication-date buckets do
+    not block each other. The actual gspread append_rows() call runs
+    OUTSIDE the buffer lock so workers can keep enqueuing while the
+    flush is in flight against Google.
+
+    Flush triggers (whichever fires first):
+      • size:  buffer reaches max_size (default 10) — flush in
+        whatever thread queued the row that pushed it over the line.
+      • timer: SheetsWriter._batch_timer_thread wakes once per second
+        and calls maybe_flush_on_timer() — flushes any tab whose
+        oldest row is more than _BATCH_FLUSH_INTERVAL_SEC seconds old.
+      • shutdown: SheetsWriter.flush_all() (atexit) drains every tab.
+
+    Retry policy on the gspread call mirrors the per-row policy used
+    elsewhere in this module: up to 4 attempts with 0/5/15/45s backoff,
+    quota-aware, force_reconnect on a half-connected client.
+    """
+
+    def __init__(self, writer: "SheetsWriter", worksheet, tab_name: str, max_size: int = 10):
+        import threading
+        self.writer = writer
+        self.worksheet = worksheet
+        self.tab_name = tab_name
+        self.max_size = max_size
+        self.lock = threading.Lock()
+        self.flush_lock = threading.Lock()  # serialise flushes per tab
+        self.rows: list = []
+        self.labels: list = []  # human-readable tags for log lines
+        self.first_added_at: Optional[float] = None  # epoch seconds
+
+    def add(self, row: list, label: str) -> None:
+        """Enqueue a row. If buffer hits max_size, flush in this thread."""
+        import time as _t
+        with self.lock:
+            self.rows.append(row)
+            self.labels.append(label)
+            if self.first_added_at is None:
+                self.first_added_at = _t.time()
+            should_flush = len(self.rows) >= self.max_size
+        if should_flush:
+            self.flush()
+
+    def maybe_flush_on_timer(self, max_age_sec: float) -> None:
+        """Called by the writer's daemon timer thread. Flush if the
+        oldest row in the buffer is older than max_age_sec."""
+        import time as _t
+        with self.lock:
+            if not self.rows or self.first_added_at is None:
+                return
+            age = _t.time() - self.first_added_at
+            if age < max_age_sec:
+                return
+        # Drop lock before flush; flush() takes its own snapshot.
+        self.flush()
+
+    def flush(self) -> bool:
+        """Drain buffer to the sheet. Safe to call concurrently with
+        add() — we snapshot under the buffer lock, then run the slow
+        Google API call serialised by flush_lock so two timers don't
+        both POST the same payload."""
+        # Drain under the buffer lock so callers see an empty buffer
+        # immediately and any new rows start a fresh window.
+        with self.lock:
+            if not self.rows:
+                return True
+            rows = self.rows
+            labels = self.labels
+            self.rows = []
+            self.labels = []
+            self.first_added_at = None
+
+        # Serialise the actual API call per tab so timer + size-trigger
+        # flushes never race each other.
+        with self.flush_lock:
+            return self._send(rows, labels)
+
+    def _send(self, rows: list, labels: list) -> bool:
+        import time as _t
+        backoff = [0, 5, 15, 45]
+        for attempt in range(1, len(backoff) + 1):
+            if backoff[attempt - 1] > 0:
+                _t.sleep(backoff[attempt - 1])
+            try:
+                self.worksheet.append_rows(rows, value_input_option='USER_ENTERED')
+                logger.info(
+                    f"  ✓ Sheets [{self.tab_name}] batch flushed: {len(rows)} rows"
+                )
+                if labels:
+                    # One-line digest so individual properties are still
+                    # traceable in the journal.
+                    sample = ', '.join(str(l) for l in labels[:3])
+                    extra = '' if len(labels) <= 3 else f' (+{len(labels) - 3} more)'
+                    logger.info(f"    → {sample}{extra}")
+                return True
+            except Exception as e:
+                msg = str(e).lower()
+                is_quota = (
+                    '429' in msg
+                    or 'quota' in msg
+                    or 'rate' in msg
+                    or 'resource_exhausted' in msg
+                )
+                if is_quota and attempt < len(backoff):
+                    logger.warning(
+                        f"  Sheets batch [{self.tab_name}] quota hit "
+                        f"(attempt {attempt}/{len(backoff)}) — backing off "
+                        f"{backoff[attempt]}s"
+                    )
+                    continue
+                if attempt < len(backoff):
+                    logger.warning(
+                        f"  Sheets batch [{self.tab_name}] transient error "
+                        f"(attempt {attempt}/{len(backoff)}) — forcing reconnect: {e}"
+                    )
+                    self.writer._force_reconnect()
+                    # Re-fetch worksheet after reconnect — handle on the SAME
+                    # thread so subsequent retries see a fresh handle.
+                    try:
+                        self.worksheet = self.writer._get_or_create_worksheet(self.tab_name)
+                    except Exception as we:
+                        logger.warning(
+                            f"  Sheets batch [{self.tab_name}] worksheet refetch failed: {we}"
+                        )
+                    continue
+                logger.error(
+                    f"  ✗ Sheets batch [{self.tab_name}] FAILED after {attempt} attempts — "
+                    f"{len(rows)} rows lost: {e}"
+                )
+                return False
+        return False
+
+
 class SheetsWriter:
     """Writes property data to Google Sheets in real-time."""
+
+    # ── Batch-write tunables ──────────────────────────────────
+    # Three scraper workers append rows concurrently. We coalesce them into
+    # one Google Sheets API call per N rows (or every flush-interval
+    # seconds, whichever comes first) so we don't blow the 60-write/min
+    # quota and cause cascading 429 backoffs.
+    _BATCH_SIZE = 10                # flush when buffer reaches this
+    _BATCH_FLUSH_INTERVAL_SEC = 3.0 # flush sooner if any row sits this long
 
     def __init__(
         self,
@@ -97,6 +242,19 @@ class SheetsWriter:
         # reported failure due to Google API eventual consistency but actually
         # landed, so the property never got added to KVK and gets re-scraped).
         self._tab_urls: dict = {}   # tab_name -> set(url)
+
+        # Batch-write state. One queue per sheet tab so concurrent workers
+        # writing to different publication_date buckets never block each
+        # other and we always flush homogeneous rows with one API call.
+        self._batches: dict = {}                # tab_name -> _BatchBuffer
+        self._batches_lock = threading.Lock()   # guards _batches dict
+        self._batch_timer_stop = threading.Event()
+        self._batch_timer_thread: Optional[threading.Thread] = None
+        self._start_batch_timer()
+        # Best-effort flush on interpreter shutdown so the last partial
+        # batch isn't silently lost.
+        import atexit
+        atexit.register(self.flush_all)
 
     # ── Connection ────────────────────────────────────────────
 
@@ -339,118 +497,157 @@ class SheetsWriter:
         return config.PUBLICATION_DATE_TABS.get(publication_date, f'{publication_date} Days')
 
     def write_property(self, prop: dict, publication_date: int) -> bool:
-        """Write a single property row to the correct sheet tab.
+        """Queue a property row for the next batch flush to its tab.
 
-        Dedup guard: if the property URL is already present in the tab (seeded
-        from the sheet on first use + tracked across this session), skip the
-        append and return True. Returning True is intentional — it makes the
-        controller treat the property as 'written' so it gets added to KVK
-        storage, closing the loop that previously could leave a stale dup.
+        Returns True after the row is buffered (or skipped as a duplicate)
+        — same external contract as the old per-row implementation, so the
+        scraper module sees no change. The actual Google Sheets API call
+        happens later, either when the buffer for this tab fills to
+        _BATCH_SIZE rows or when the background timer thread observes the
+        buffer is older than _BATCH_FLUSH_INTERVAL_SEC.
 
-        Retry policy:
-          - Google API quota errors (429 / RESOURCE_EXHAUSTED): up to 4
-            attempts with exponential backoff (5s, 15s, 45s) so long runs
-            survive the 60-write/min/project cap.
-          - Other transient errors (token expiry, network blip,
-            half-connected client): force_reconnect + retry once.
+        Three scraper workers can call this concurrently; per-tab locks +
+        the connect lock guarantee no two threads ever fight over the same
+        gspread session or batch buffer.
         """
-        import time as _time
-        attempts = 4
-        backoff = [0, 5, 15, 45]  # seconds before attempts 1..4
-
-        last_exc: Optional[Exception] = None
-        for attempt in range(1, attempts + 1):
-            if backoff[attempt - 1] > 0:
-                _time.sleep(backoff[attempt - 1])
-            try:
-                return self._write_property_once(prop, publication_date)
-            except Exception as e:
-                last_exc = e
-                msg = str(e).lower()
-                is_quota = (
-                    '429' in msg
-                    or 'quota' in msg
-                    or 'rate' in msg
-                    or 'resource_exhausted' in msg
-                )
-                if is_quota and attempt < attempts:
-                    logger.warning(
-                        f"  Sheets quota hit (attempt {attempt}/{attempts}) — "
-                        f"backing off {backoff[attempt]}s: {e}"
-                    )
-                    continue
-                if attempt < attempts:
-                    logger.warning(
-                        f"  Sheets write transient error (attempt {attempt}/{attempts}) — "
-                        f"forcing reconnect: {e}"
-                    )
-                    self._force_reconnect()
-                    continue
-                logger.error(f"  ✗ Sheets write failed after {attempt} attempts: {e}")
-                return False
-        return False
-
-    def _write_property_once(self, prop: dict, publication_date: int) -> bool:
         tab_name = self._get_tab_name(publication_date)
-        try:
-            ws = self._get_or_create_worksheet(tab_name)
+        url = (prop.get('url', '') or '').strip()
 
-            url = (prop.get('url', '') or '').strip()
-            if url and url in self._tab_urls.get(tab_name, set()):
+        # Cross-session dedup. Has to happen before the row enters the
+        # batch buffer so a re-scrape of a property already in the sheet
+        # does not produce a duplicate row.
+        if url:
+            existing = self._tab_urls.get(tab_name)
+            if existing is None:
+                # First touch on this tab — seed the URL set from the sheet
+                # so dedup survives a backend restart mid-run.
+                try:
+                    self._seed_tab_urls(tab_name)
+                    existing = self._tab_urls.get(tab_name, set())
+                except Exception as e:
+                    logger.debug(f"  Sheets [{tab_name}]: dedup seed failed: {e}")
+                    existing = self._tab_urls.setdefault(tab_name, set())
+            if url in existing:
                 logger.info(f"  Sheets [{tab_name}]: URL already present — skipping duplicate: {url}")
                 return True
 
-            images_joined = ', '.join(prop.get('photo_urls', []))
+        images_joined = ', '.join(prop.get('photo_urls', []))
+        row = [
+            date.today().isoformat(),
+            prop.get('url', ''),
+            prop.get('address', ''),
+            prop.get('listed_since', ''),
+            prop.get('days_on_market', '') or '',
+            prop.get('asking_price', '') or '',
+            # Valuation cells — filled by valuation worker (Walter-free)
+            prop.get('woz_value', ''),
+            prop.get('suggested_bid', ''),
+            '',                                # Bidding Price — EMPTY for user
+            prop.get('price_per_m2', '') or '',
+            prop.get('living_area', '') or '',
+            prop.get('plot_area', '') or '',
+            prop.get('rooms', '') or '',
+            prop.get('bedrooms', '') or '',
+            prop.get('construction_year', '') or '',
+            prop.get('property_type', ''),
+            prop.get('energielabel', ''),
+            prop.get('heating', ''),
+            prop.get('insulation', ''),
+            prop.get('maintenance_inside', ''),
+            prop.get('maintenance_outside', ''),
+            prop.get('garden', ''),
+            prop.get('garden_orientation', ''),
+            prop.get('parking', ''),
+            prop.get('vve_contribution', ''),
+            prop.get('erfpacht', ''),
+            prop.get('acceptance', ''),
+            prop.get('description', ''),
+            images_joined,
+            prop.get('agency_name', ''),
+            prop.get('agency_phone', ''),
+            prop.get('agency_email', ''),
+            prop.get('agency_website', ''),
+        ]
+        # Reserve the URL immediately so a second worker that scrapes the
+        # same property in parallel skips it as a duplicate. If the batch
+        # flush ultimately fails we DON'T un-reserve — the property is
+        # already in KVK in that case (controller marked it written), and
+        # the safer behavior is to surface the loss in logs than to risk a
+        # double row on the next scrape.
+        if url:
+            self._tab_urls.setdefault(tab_name, set()).add(url)
 
-            row = [
-                date.today().isoformat(),
-                prop.get('url', ''),
-                prop.get('address', ''),
-                prop.get('listed_since', ''),
-                prop.get('days_on_market', '') or '',
-                prop.get('asking_price', '') or '',
-                # Valuation cells — filled by valuation worker (Walter-free)
-                prop.get('woz_value', ''),
-                prop.get('suggested_bid', ''),
-                '',                                # Bidding Price — EMPTY for user
-                prop.get('price_per_m2', '') or '',
-                prop.get('living_area', '') or '',
-                prop.get('plot_area', '') or '',
-                prop.get('rooms', '') or '',
-                prop.get('bedrooms', '') or '',
-                prop.get('construction_year', '') or '',
-                prop.get('property_type', ''),
-                prop.get('energielabel', ''),
-                prop.get('heating', ''),
-                prop.get('insulation', ''),
-                prop.get('maintenance_inside', ''),
-                prop.get('maintenance_outside', ''),
-                prop.get('garden', ''),
-                prop.get('garden_orientation', ''),
-                prop.get('parking', ''),
-                prop.get('vve_contribution', ''),
-                prop.get('erfpacht', ''),
-                prop.get('acceptance', ''),
-                prop.get('description', ''),
-                images_joined,
-                prop.get('agency_name', ''),
-                prop.get('agency_phone', ''),
-                prop.get('agency_email', ''),
-                prop.get('agency_website', ''),
-            ]
+        batch = self._get_batch(tab_name)
+        batch.add(row, prop.get('address', prop.get('id', '?')))
+        return True
 
-            ws.append_row(row, value_input_option='USER_ENTERED')
-            # Track the URL so we never append it again this session.
-            if url:
-                self._tab_urls.setdefault(tab_name, set()).add(url)
-            logger.info(
-                f"  ✓ Sheets [{tab_name}]: {prop.get('address', prop.get('id', '?'))}"
-            )
-            return True
+    # ── Batch-write internals ─────────────────────────────────
 
+    def _seed_tab_urls(self, tab_name: str) -> None:
+        """Populate _tab_urls[tab_name] from column B of the sheet tab.
+        Called on first write to a tab so URLs already in the sheet count
+        as duplicates even if this session never wrote them itself."""
+        ws = self._get_or_create_worksheet(tab_name)
+        col_b = ws.col_values(2)  # Property URL column
+        # First row is the header.
+        urls = {v.strip() for v in col_b[1:] if v and v.strip()}
+        self._tab_urls[tab_name] = urls
+        logger.info(f"  Sheets [{tab_name}]: dedup seeded with {len(urls)} URLs")
+
+    def _get_batch(self, tab_name: str) -> "_BatchBuffer":
+        """Return (creating if needed) the per-tab batch buffer."""
+        with self._batches_lock:
+            buf = self._batches.get(tab_name)
+            if buf is None:
+                ws = self._get_or_create_worksheet(tab_name)
+                buf = _BatchBuffer(
+                    writer=self,
+                    worksheet=ws,
+                    tab_name=tab_name,
+                    max_size=self._BATCH_SIZE,
+                )
+                self._batches[tab_name] = buf
+            return buf
+
+    def _start_batch_timer(self) -> None:
+        """Start the daemon thread that flushes any tab whose buffer is
+        older than _BATCH_FLUSH_INTERVAL_SEC. Thread is restartable —
+        if a prior call left a thread running, it keeps running."""
+        import threading
+        if self._batch_timer_thread is not None and self._batch_timer_thread.is_alive():
+            return
+
+        def loop():
+            while not self._batch_timer_stop.wait(1.0):
+                try:
+                    with self._batches_lock:
+                        items = list(self._batches.values())
+                    for b in items:
+                        b.maybe_flush_on_timer(self._BATCH_FLUSH_INTERVAL_SEC)
+                except Exception as e:
+                    logger.warning(f"Sheets batch timer iteration failed: {e}")
+
+        self._batch_timer_thread = threading.Thread(
+            target=loop,
+            name="sheets-batch-flush",
+            daemon=True,
+        )
+        self._batch_timer_thread.start()
+
+    def flush_all(self) -> None:
+        """Drain every per-tab buffer immediately. Called on graceful
+        shutdown (atexit) so the last partial batch lands in the sheet."""
+        try:
+            with self._batches_lock:
+                items = list(self._batches.values())
+            for b in items:
+                try:
+                    b.flush()
+                except Exception as e:
+                    logger.warning(f"Sheets flush_all: tab {b.tab_name} failed: {e}")
         except Exception:
-            # Bubble up so the outer write_property can decide to reconnect+retry.
-            raise
+            # Atexit must never raise.
+            pass
 
     def write_properties(self, properties: list, publication_date: int) -> int:
         written = 0
