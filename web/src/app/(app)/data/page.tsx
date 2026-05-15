@@ -19,10 +19,11 @@ import { EmailModal } from "@/components/email-modal";
 import { PropertiesTable } from "@/components/properties-table";
 import { formatNumber } from "@/lib/utils";
 
-// Infinite scroll: page size = 100 rows. Each page is a small JSON
-// payload (~150KB compact) so memory + CPU + DB stay flat regardless
-// of total dataset size — works the same at 3k or 1M rows.
-const PAGE_SIZE = 100;
+// Infinite scroll: page size = 50 rows. Smaller pages = faster first
+// paint and smoother fetch cadence as the user scrolls. Memory + CPU
+// + DB stay flat regardless of total dataset size — works the same at
+// 3k or 1M rows.
+const PAGE_SIZE = 50;
 
 const TAB_OPTIONS = [
   "3-7 Days Ago",
@@ -173,7 +174,7 @@ export default function DataPage() {
             ? "Loading…"
             : `${formatNumber(items.length)} of ${formatNumber(total)} properties`}
           {isFetching && !isLoading && !isFetchingNextPage ? " · refreshing…" : ""}
-          {isFetchingNextPage ? " · loading next 100…" : ""}
+          {isFetchingNextPage ? " · loading next 50…" : ""}
           {!hasNextPage && items.length > 0 ? " · all loaded" : ""}
         </span>
       </div>

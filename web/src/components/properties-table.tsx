@@ -292,7 +292,7 @@ export function PropertiesTable({
             {isLoadingMore ? (
               <>
                 <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                Loading next 100…
+                Loading next 50…
               </>
             ) : (
               <span>End of results</span>
