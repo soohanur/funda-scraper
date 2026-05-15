@@ -89,10 +89,24 @@ export default function DataPage() {
   });
 
   // Flatten loaded pages into one items array for the virtualizer.
-  const items: Property[] = useMemo(
-    () => (data?.pages ?? []).flatMap((p) => p.items as Property[]),
-    [data],
-  );
+  // Offset pagination + concurrent inserts (Sheet→DB auto-sync runs
+  // every 30s) means the same DB row can appear at two different
+  // offsets — once at offset N (before insert) and once at offset
+  // N+5 (after 5 new rows shift everything). Without dedup React
+  // gets duplicate keys and paints both rows on top of each other.
+  // Dedup-by-id keeps the first occurrence (which is older / further
+  // up the list, preserving sort order).
+  const items: Property[] = useMemo(() => {
+    const all = (data?.pages ?? []).flatMap((p) => p.items as Property[]);
+    const seen = new Set<number>();
+    const out: Property[] = [];
+    for (const p of all) {
+      if (seen.has(p.id)) continue;
+      seen.add(p.id);
+      out.push(p);
+    }
+    return out;
+  }, [data]);
   const total = data?.pages[0]?.total ?? 0;
 
   const syncM = useMutation({

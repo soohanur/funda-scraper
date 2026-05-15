@@ -94,7 +94,15 @@ export default function ScraperPage() {
     { value: 30, label: "25-30 Days Ago" },
     { value: 31, label: "30+ Days Ago" },
   ];
-  const selectedDate = selectedDateOverride ?? optionsData?.default ?? 5;
+  // While the scraper is running/paused/stopping, the active filter is
+  // pinned to whatever the controller is actually scraping — the user
+  // can't accidentally pick a different bucket while one is in flight.
+  const activeDate = status.publication_date ?? null;
+  const isLockedToActive =
+    activeDate != null && (status.status === "RUNNING" || status.status === "PAUSED" || status.status === "STOPPING");
+  const selectedDate = isLockedToActive
+    ? activeDate
+    : (selectedDateOverride ?? optionsData?.default ?? 5);
 
   const { data: sheetsData } = useQuery({
     queryKey: ["funda", "sheets-url"],

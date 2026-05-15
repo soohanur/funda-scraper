@@ -32,6 +32,8 @@ export type ScraperStatus = {
   duplicate_in_storage: number;
   duplicate_in_retry_queue: number;
   consecutive_failures: number;
+  /** Active publication_date filter — present only while RUNNING/PAUSED/STOPPING. */
+  publication_date?: number | null;
 };
 
 export type PublicationDateOption = { value: number; label: string };

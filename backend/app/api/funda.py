@@ -61,6 +61,9 @@ class StatusResponse(BaseModel):
     duplicate_in_storage: int = 0
     duplicate_in_retry_queue: int = 0
     consecutive_failures: int = 0
+    # Active publication_date filter currently being scraped (5/10/15/30/31).
+    # None when scraper IDLE — frontend uses this to lock the date dropdown.
+    publication_date: Optional[int] = None
 
 
 class ActionResponse(BaseModel):
@@ -219,6 +222,16 @@ async def get_status():
         stats['total_kvk_stored'] = _get_kvk_storage().count()
     except Exception:
         # If storage is temporarily unavailable, keep existing stats value.
+        pass
+
+    # Surface the active publication_date so the frontend can lock the
+    # date dropdown to whatever is currently running. None when IDLE.
+    try:
+        ctrl = _get_controller()
+        if ctrl is not None and getattr(ctrl, 'publication_date', None) is not None:
+            if stats.get('status') in ('RUNNING', 'PAUSED', 'STOPPING'):
+                stats['publication_date'] = int(ctrl.publication_date)
+    except Exception:
         pass
 
     return StatusResponse(**stats)
